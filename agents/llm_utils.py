@@ -6,9 +6,18 @@ def call_llm(llm: Any, prompt: str) -> str:
 
     Supports objects with methods: invoke({input:...}), predict(str), or simple callables.
     """
-    # 1. LangChain-style LLMs that expose `invoke`
+    # Prefer passing a raw string / PromptValue where possible.
+    # 1. Try LangChain-style LLMs with string input: llm.invoke(prompt)
     if hasattr(llm, "invoke"):
-        res = llm.invoke({"input": prompt})
+        try:
+            res = llm.invoke(prompt)
+        except Exception:
+            # Some implementations expect a dict-like payload. Try that as a fallback.
+            try:
+                res = llm.invoke({"input": prompt})
+            except Exception as e:
+                raise RuntimeError(f"LLM.invoke failed for both string and dict inputs: {e}")
+
         # res may be dict-like or string
         if isinstance(res, dict):
             for key in ("answer", "result", "output", "text"):
@@ -20,11 +29,17 @@ def call_llm(llm: Any, prompt: str) -> str:
 
     # 2. Objects with `predict` (some wrappers)
     if hasattr(llm, "predict"):
-        return llm.predict(prompt)
+        try:
+            return llm.predict(prompt)
+        except Exception as e:
+            raise RuntimeError(f"LLM.predict failed: {e}")
 
     # 3. Callable (simple function)
     if callable(llm):
-        return llm(prompt)
+        try:
+            return llm(prompt)
+        except Exception as e:
+            raise RuntimeError(f"LLM callable failed: {e}")
 
     raise RuntimeError("LLM object has no supported call interface (invoke/predict/callable)")
 
