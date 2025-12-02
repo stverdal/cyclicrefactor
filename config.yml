@@ -1,0 +1,38 @@
+llm:
+  provider: ollama
+  model: qwen2.5-coder:32b-32768
+  params:
+    num_ctx: 18000
+    temperature: 0.0
+
+io:
+  artifacts_dir: artifacts
+  cyclic_folder: cyclicDepen
+  prompts_dir: prompts
+
+pipeline:
+  agents_order: [describer, refactor, validator]
+  max_iterations: 2
+  enable:
+    describer: true
+    refactor: true
+    validator: true
+
+prompts:
+  describer: prompts/prompt_describer.txt
+  refactor: prompts/prompt_refactor.txt
+
+retriever:
+  type: chroma
+  persist_dir: cache/chroma_db
+  search_kwargs:
+    k: 4
+
+validator:
+  linters:
+    python: "flake8"
+  test_command: "pytest -q"
+
+logging:
+  level: INFO
+  log_file: langCodeUnderstanding.log
