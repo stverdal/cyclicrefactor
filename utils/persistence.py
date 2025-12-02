@@ -49,20 +49,53 @@ class Persistor:
         p = self.save_json(artifact_id, "proposal/proposal.json", proposal)
         # persist patches as individual files and diffs
         patches = proposal.get("patches", [])
+        base = self.artifact_path(artifact_id)
+        base_resolved = base.resolve()
+
         for patch in patches:
-            path = patch.get("path") or "unknown"
-            # normalize path to safe filename
-            safe_path = Path("patches") / Path(path)
-            full_patch_path = self.artifact_path(artifact_id) / safe_path
+            orig_path = patch.get("path") or "unknown"
+            # Build a sanitized relative path under artifacts/{id}/patches
+            ppath = Path(orig_path)
+
+            if ppath.is_absolute():
+                # drop the drive/anchor and use remaining parts
+                parts = list(ppath.parts)[1:]
+                if not parts:
+                    parts = [ppath.name]
+            else:
+                # remove any parent traversal components for safety
+                parts = [part for part in ppath.parts if part not in ("..", ".")]
+
+            safe_rel = Path("patches").joinpath(*parts)
+            full_patch_path = base.joinpath(safe_rel)
+            # Ensure parent exists
             full_patch_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Defensive check: ensure we are writing inside the artifact dir
+            try:
+                full_patch_path_resolved = full_patch_path.resolve()
+                # This will raise ValueError if not a subpath
+                full_patch_path_resolved.relative_to(base_resolved)
+            except Exception:
+                # Fallback to a safe location: artifacts/{id}/patches/<basename>
+                full_patch_path = base / "patches" / Path(ppath.name)
+                full_patch_path.parent.mkdir(parents=True, exist_ok=True)
+
             with open(full_patch_path, "w", encoding="utf-8") as f:
                 f.write(patch.get("patched", ""))
 
-            # diffs
+            # diffs: write alongside in artifacts/{id}/diffs/<same_sanitized_path>.diff
             diff_text = patch.get("diff", "")
             if diff_text:
-                diff_path = self.artifact_path(artifact_id) / Path("diffs") / Path(path + ".diff")
-                diff_path.parent.mkdir(parents=True, exist_ok=True)
+                diff_rel = Path("diffs") / safe_rel
+                diff_path = base.joinpath(diff_rel.with_suffix(diff_rel.suffix + ".diff"))
+                try:
+                    diff_path.parent.mkdir(parents=True, exist_ok=True)
+                    diff_path_resolved = diff_path.resolve()
+                    diff_path_resolved.relative_to(base_resolved)
+                except Exception:
+                    diff_path = base / "diffs" / Path(ppath.name + ".diff")
+                    diff_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(diff_path, "w", encoding="utf-8") as df:
                     df.write(diff_text)
 
