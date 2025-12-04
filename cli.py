@@ -19,13 +19,15 @@ def main():
     with open(args.input_json, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # Normalize input into canonical cycle_spec
+    # Normalize input into canonical CycleSpec model
     cycle_spec = normalize_input(raw, cycle_id=args.cycle_id, read_files=args.read_files)
 
     cfg = load_config(args.config)
 
     orch = Orchestrator(config=cfg)
-    results = orch.run_pipeline(cycle_spec, prompt=cycle_spec.get("prompt"))
+    # CycleSpec model doesn't have a prompt field; pass None or extract from metadata
+    prompt = cycle_spec.metadata.get("prompt") if cycle_spec.metadata else None
+    results = orch.run_pipeline(cycle_spec, prompt=prompt)
 
     print("Description:\n", results.get("description"))
     print("Proposal:\n", results.get("proposal"))

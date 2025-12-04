@@ -1,8 +1,8 @@
 llm:
-  provider: ollama
-  model: qwen2.5-coder:32b-32768
+  provider: none
+  model: ""
   params:
-    num_ctx: 18000
+    num_ctx: 4096
     temperature: 0.0
 
 io:
@@ -11,16 +11,19 @@ io:
   prompts_dir: prompts
 
 pipeline:
-  agents_order: [describer, refactor, validator]
+  agents_order: [describer, refactor, validator, explainer]
   max_iterations: 2
   enable:
     describer: true
     refactor: true
     validator: true
+    explainer: true
 
 prompts:
   describer: prompts/prompt_describer.txt
   refactor: prompts/prompt_refactor.txt
+  validator: prompts/prompt_validator.txt
+  explainer: prompts/prompt_explainer.txt
 
 retriever:
   type: chroma

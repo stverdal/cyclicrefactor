@@ -4,28 +4,24 @@ from typing import Any
 def call_llm(llm: Any, prompt: str) -> str:
     """Try common call patterns for different LLM wrappers and return string output.
 
-    Supports objects with methods: invoke({input:...}), predict(str), or simple callables.
+    Supports objects with methods: invoke(str), predict(str), or simple callables.
     """
-    # Prefer passing a raw string / PromptValue where possible.
     # 1. Try LangChain-style LLMs with string input: llm.invoke(prompt)
     if hasattr(llm, "invoke"):
         try:
             res = llm.invoke(prompt)
-        except Exception:
-            # Some implementations expect a dict-like payload. Try that as a fallback.
-            try:
-                res = llm.invoke({"input": prompt})
-            except Exception as e:
-                raise RuntimeError(f"LLM.invoke failed for both string and dict inputs: {e}")
-
-        # res may be dict-like or string
-        if isinstance(res, dict):
-            for key in ("answer", "result", "output", "text"):
-                if key in res:
-                    return res[key]
-            # Fallback to stringifying
+            # res may be an AIMessage, dict, or string
+            if hasattr(res, "content"):
+                # LangChain AIMessage
+                return str(res.content)
+            if isinstance(res, dict):
+                for key in ("answer", "result", "output", "text", "content"):
+                    if key in res:
+                        return str(res[key])
+                return str(res)
             return str(res)
-        return str(res)
+        except Exception as e:
+            raise RuntimeError(f"LLM.invoke failed: {e}")
 
     # 2. Objects with `predict` (some wrappers)
     if hasattr(llm, "predict"):
@@ -49,6 +45,7 @@ def create_llm_from_config(cfg: Any) -> Any:
 
     cfg can be a dict-like or object with attributes `provider`, `model`, `params`.
     The returned object should be compatible with `call_llm` (invoke/predict/callable).
+    Returns None if the LLM service is not available.
     """
     provider = None
     model = None
@@ -66,25 +63,43 @@ def create_llm_from_config(cfg: Any) -> Any:
 
     # Ollama (langchain_ollama.ChatOllama)
     if provider and "ollama" in provider.lower():
+        # Check if Ollama is reachable before importing/creating client
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            result = sock.connect_ex(('localhost', 11434))
+            sock.close()
+            if result != 0:
+                print("[WARNING] Ollama not reachable at localhost:11434, running without LLM")
+                return None
+        except Exception:
+            sock.close()
+            print("[WARNING] Could not check Ollama availability, running without LLM")
+            return None
+
         try:
             from langchain_ollama import ChatOllama
-
-            # Map common params
             llm = ChatOllama(model=model, **params)
             return llm
-        except Exception:
-            # Fallback mock
-            return lambda prompt: f"[mock-ollama] {prompt}"
+        except Exception as e:
+            print(f"[WARNING] Failed to create Ollama client: {e}")
+            return None
 
     # Anthropic (langchain_anthropic.ChatAnthropic)
     if provider and "anthropic" in provider.lower():
+        import os
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            print("[WARNING] ANTHROPIC_API_KEY not set, running without LLM")
+            return None
         try:
             from langchain_anthropic import ChatAnthropic
-
             llm = ChatAnthropic(model_name=model, **params)
             return llm
-        except Exception:
-            return lambda prompt: f"[mock-anthropic] {prompt}"
+        except Exception as e:
+            print(f"[WARNING] Failed to create Anthropic client: {e}")
+            return None
 
-    # Fallback: return a simple echo callable
-    return lambda prompt: f"[mock-llm] {prompt}"
+    # Fallback: return None (no LLM available)
+    print(f"[WARNING] Unknown LLM provider '{provider}', running without LLM")
+    return None
