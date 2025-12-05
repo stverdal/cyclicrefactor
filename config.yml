@@ -28,6 +28,11 @@ prompts:
 retriever:
   type: chroma
   persist_dir: cache/chroma_db
+  data_dir: data/pdf
+  embedding_provider: huggingface
+  embedding_model: all-MiniLM-L6-v2
+  collection_name: architecture_docs
+  search_type: similarity
   search_kwargs:
     k: 4
 

@@ -5,6 +5,7 @@ from agents.refactor_agent import RefactorAgent
 from agents.validator import ValidatorAgent
 from agents.explainer import ExplainerAgent
 from utils.persistence import Persistor
+from utils.logging import get_logger
 from agents.llm_utils import create_llm_from_config
 from config import AppConfig
 from models.schemas import (
@@ -14,11 +15,11 @@ from models.schemas import (
     ValidationReport,
     Explanation,
 )
+from rag.rag_service import RAGService
 import time
 import json
-import logging
 
-logger = logging.getLogger(__name__)
+logger = get_logger("orchestrator")
 
 
 class Orchestrator:
@@ -42,6 +43,18 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Failed to create LLM client: {e}")
             self.llm = None
+        
+        # Create RAG service from config
+        try:
+            self.rag_service = RAGService(self.config.retriever)
+            if self.rag_service.is_available():
+                logger.info("RAG service initialized and available")
+            else:
+                logger.warning("RAG service not available - run pdf_indexer first")
+                self.rag_service = None
+        except Exception as e:
+            logger.warning(f"Failed to create RAG service: {e}")
+            self.rag_service = None
 
         # Pipeline settings
         self.max_iterations = getattr(self.config.pipeline, "max_iterations", 2)
@@ -95,6 +108,7 @@ class Orchestrator:
             describer = DescriberAgent(
                 llm=self.llm,
                 prompt_template=self._get_prompt_template("describer"),
+                rag_service=self.rag_service,
             )
             desc_result = describer.run(cycle_spec, prompt=prompt)
             results["description"] = desc_result.output
@@ -135,6 +149,7 @@ class Orchestrator:
                 refactor = RefactorAgent(
                     llm=self.llm,
                     prompt_template=self._get_prompt_template("refactor"),
+                    rag_service=self.rag_service,
                 )
                 # Convert description to CycleDescription model if needed
                 description = desc_result.output

@@ -3,20 +3,54 @@ from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.snippet_selector import select_relevant_snippet
 from utils.prompt_loader import load_template, safe_format
+from utils.logging import get_logger
 from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport
 import json
 import difflib
 import re
 
+logger = get_logger("refactor")
+
 
 class RefactorAgent(Agent):
     name = "refactor"
-    version = "0.5"
+    version = "0.6"
 
-    def __init__(self, llm=None, prompt_template: str = None, max_file_chars: int = 4000):
+    def __init__(
+        self,
+        llm=None,
+        prompt_template: str = None,
+        max_file_chars: int = 4000,
+        rag_service=None
+    ):
         self.llm = llm
         self.prompt_template = prompt_template
         self.max_file_chars = max_file_chars
+        self.rag_service = rag_service
+    
+    def _get_rag_context(self, cycle: CycleSpec) -> str:
+        """Retrieve relevant context from RAG for refactoring guidance."""
+        if self.rag_service is None:
+            return ""
+        
+        try:
+            # Query for refactoring patterns and best practices
+            nodes = ", ".join(cycle.graph.nodes[:5])
+            query = f"dependency inversion refactoring patterns {nodes}"
+            
+            context = self.rag_service.get_relevant_context(
+                query,
+                k=3,
+                max_length=2000
+            )
+            
+            if context:
+                logger.debug(f"Retrieved RAG context for refactoring: {len(context)} chars")
+                return context
+        except Exception as e:
+            logger.warning(f"Failed to retrieve RAG context: {e}")
+        
+        return ""
 
     def _build_prompt(self, cycle: CycleSpec, description: CycleDescription) -> str:
         file_paths = cycle.get_file_paths()
@@ -71,6 +105,9 @@ class RefactorAgent(Agent):
             snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
 
         file_snippets = "\n\n".join(snippets) if snippets else ""
+        
+        # Get RAG context for refactoring guidance
+        rag_context = self._get_rag_context(cycle)
 
         if self.prompt_template:
             tpl = load_template(self.prompt_template)
@@ -81,11 +118,16 @@ class RefactorAgent(Agent):
                 files=", ".join(file_paths),
                 description=description.text,
                 file_snippets=file_snippets,
+                rag_context=rag_context,
             )
             # Append snippets if template didn't include them
             contains_file_blocks = any((f"--- FILE: {p}" in result) for p in file_paths)
             if file_snippets and "{file_snippets}" not in tpl and not contains_file_blocks:
                 result = result + "\n\n" + file_snippets
+            
+            # Append RAG context if template didn't include it
+            if rag_context and "{rag_context}" not in tpl:
+                result = result + "\n\n--- REFERENCE MATERIALS ---\n" + rag_context
             
             # Append feedback if provided
             if feedback:
@@ -102,6 +144,10 @@ class RefactorAgent(Agent):
 
         if file_snippets:
             base += "\n\n" + file_snippets
+        
+        # Include RAG context for reference
+        if rag_context:
+            base += "\n\n--- REFERENCE MATERIALS ---\n" + rag_context
 
         # Include validator feedback if this is a retry
         if feedback:
@@ -183,21 +229,27 @@ class RefactorAgent(Agent):
         Returns:
             AgentResult with RefactorProposal output.
         """
+        logger.info(f"RefactorAgent.run() starting, has_feedback={validator_feedback is not None}")
+
         # Convert inputs to models if needed
         if isinstance(cycle_spec, dict):
             cycle_spec = CycleSpec.model_validate(cycle_spec)
         if description is None:
+            logger.error("Missing description input")
             return AgentResult(status="error", output=None, logs="Missing description")
         if isinstance(description, dict):
             description = CycleDescription.model_validate(description)
         if validator_feedback is not None and isinstance(validator_feedback, dict):
             validator_feedback = ValidationReport.model_validate(validator_feedback)
+            logger.info(f"Retry with feedback: {len(validator_feedback.issues)} issues, {len(validator_feedback.suggestions)} suggestions")
 
         # Use enhanced prompt builder that includes selected file snippets and feedback
         prompt_text = self._build_prompt_with_snippets(cycle_spec, description, validator_feedback)
+        logger.debug(f"Built refactor prompt with {len(prompt_text)} chars")
 
         # If no LLM available just return original files as no-op patches
         if self.llm is None:
+            logger.info("No LLM provided, returning no-op patches (original files unchanged)")
             patches = [
                 Patch(path=f.path, original=f.content, patched=f.content, diff="")
                 for f in cycle_spec.files
@@ -206,14 +258,18 @@ class RefactorAgent(Agent):
             return AgentResult(status="success", output=proposal.model_dump())
 
         try:
+            logger.info("Calling LLM for refactor proposal")
             llm_response = call_llm(self.llm, prompt_text)
+            logger.debug(f"LLM response received, length: {len(str(llm_response))} chars")
 
             # Convert files to dict for _infer_patches compatibility
             files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
             inferred = self._infer_patches(llm_response, files_dict)
+            logger.debug(f"Inferred {len(inferred)} patches from LLM response")
 
             # Build final patches list merging originals with patched content (if present)
             patches_out = []
+            files_changed = 0
             for f in cycle_spec.files:
                 path = f.path
                 original = f.content or ""
@@ -226,9 +282,13 @@ class RefactorAgent(Agent):
                 patched = patched_entry.get("patched") if patched_entry else original
 
                 diff = self._make_unified_diff(original, patched, path) if patched != original else ""
+                if diff:
+                    files_changed += 1
+                    logger.debug(f"File changed: {path} ({len(diff)} chars diff)")
 
                 patches_out.append(Patch(path=path, original=original, patched=patched, diff=diff))
 
+            logger.info(f"RefactorAgent completed: {files_changed}/{len(patches_out)} files changed")
             proposal = RefactorProposal(
                 patches=patches_out,
                 rationale="LLM produced proposal",
@@ -236,4 +296,5 @@ class RefactorAgent(Agent):
             )
             return AgentResult(status="success", output=proposal.model_dump())
         except Exception as e:
+            logger.error(f"LLM call failed: {e}", exc_info=True)
             return AgentResult(status="error", output=None, logs=f"LLM call failed: {e}")

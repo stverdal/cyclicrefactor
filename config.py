@@ -13,6 +13,11 @@ class LLMConfig(BaseModel):
 class RetrieverConfig(BaseModel):
     type: str = "chroma"
     persist_dir: str = "cache/chroma_db"
+    data_dir: str = "data/pdf"
+    embedding_provider: str = "ollama"
+    embedding_model: str = "nomic-embed-text"
+    collection_name: str = "architecture_docs"
+    search_type: str = "similarity"  # "similarity" or "mmr"
     search_kwargs: Dict[str, Any] = {"k": 4}
 
 
@@ -51,7 +56,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
     auth = raw.get("auth", {})
     for k, v in auth.items():
         if isinstance(v, str) and v.endswith("_ENV"):
-            # config: {anthropic_api_key_env: ANTHROPIC_API_KEY}
+            # Example: {some_key_env: SOME_ENV_VAR}
             env_name = raw["auth"].get(k)
             raw["auth"][k] = os.environ.get(env_name, None)
 

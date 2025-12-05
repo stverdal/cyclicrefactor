@@ -4,6 +4,7 @@ import re
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.prompt_loader import load_template, safe_format
+from utils.logging import get_logger
 from models.schemas import (
     CycleSpec,
     CycleDescription,
@@ -11,6 +12,8 @@ from models.schemas import (
     ValidationReport,
     Explanation,
 )
+
+logger = get_logger("explainer")
 
 
 class ExplainerAgent(Agent):
@@ -128,7 +131,6 @@ Only output the JSON object.
 
     def _parse_llm_response(self, text: str) -> Dict[str, Any]:
         """Parse LLM JSON response; return dict or fallback."""
-        import re
         json_match = re.search(r"\{[\s\S]*\}", text)
         if json_match:
             try:
@@ -203,6 +205,8 @@ A cyclic dependency involving {len(nodes)} component(s) ({', '.join(nodes)}) was
         Returns:
             AgentResult with Explanation output.
         """
+        logger.info("ExplainerAgent.run() starting")
+
         # Convert inputs to models if needed
         if isinstance(cycle_spec, dict):
             cycle_spec = CycleSpec.model_validate(cycle_spec)
@@ -211,6 +215,7 @@ A cyclic dependency involving {len(nodes)} component(s) ({', '.join(nodes)}) was
         elif isinstance(description, dict):
             description = CycleDescription.model_validate(description)
         if proposal is None:
+            logger.error("Missing proposal input")
             return AgentResult(
                 status="error", output=None, logs="Missing proposal"
             )
@@ -223,6 +228,7 @@ A cyclic dependency involving {len(nodes)} component(s) ({', '.join(nodes)}) was
 
         # If validation didn't pass, we shouldn't be here, but handle gracefully
         if not validation.approved:
+            logger.warning("Explainer called with unapproved proposal, skipping")
             return AgentResult(
                 status="error",
                 output=None,
@@ -231,20 +237,26 @@ A cyclic dependency involving {len(nodes)} component(s) ({', '.join(nodes)}) was
 
         # If no LLM, use fallback
         if self.llm is None:
+            logger.info("No LLM provided, using fallback explanation generator")
             result = self._generate_fallback(cycle_spec, description, proposal)
+            logger.debug(f"Generated fallback explanation: {result.title}")
             return AgentResult(status="success", output=result.model_dump())
 
         # LLM-based explanation
         prompt = self._build_prompt(cycle_spec, description, proposal, validation)
+        logger.debug(f"Built explanation prompt with {len(prompt)} chars")
 
         try:
+            logger.info("Calling LLM for explanation generation")
             response = call_llm(self.llm, prompt)
             text = response if isinstance(response, str) else json.dumps(response)
             parsed = self._parse_llm_response(text)
             # Validate through Explanation model
             result = Explanation.model_validate(parsed)
+            logger.info(f"ExplainerAgent completed: {result.title}")
             return AgentResult(status="success", output=result.model_dump())
         except Exception as e:
+            logger.error(f"LLM call failed: {e}", exc_info=True)
             return AgentResult(
                 status="error", output=None, logs=f"LLM call failed: {e}"
             )

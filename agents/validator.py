@@ -4,6 +4,7 @@ import re
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.prompt_loader import load_template, safe_format
+from utils.logging import get_logger
 from models.schemas import (
     CycleSpec,
     CycleDescription,
@@ -11,6 +12,8 @@ from models.schemas import (
     ValidationReport,
     ValidationIssue,
 )
+
+logger = get_logger("validator")
 
 
 class ValidatorAgent(Agent):
@@ -189,6 +192,8 @@ Only output the JSON object, nothing else.
         Returns:
             AgentResult with ValidationReport output.
         """
+        logger.info("ValidatorAgent.run() starting")
+
         # Convert inputs to models if needed
         if isinstance(cycle_spec, dict):
             cycle_spec = CycleSpec.model_validate(cycle_spec)
@@ -197,18 +202,23 @@ Only output the JSON object, nothing else.
         elif isinstance(description, dict):
             description = CycleDescription.model_validate(description)
         if proposal is None:
+            logger.error("Missing proposal input")
             return AgentResult(
                 status="error", output=None, logs="Missing proposal"
             )
         if isinstance(proposal, dict):
             proposal = RefactorProposal.model_validate(proposal)
 
+        logger.debug(f"Validating proposal with {len(proposal.patches)} patches")
+
         # Rule-based checks first
         rule_issues = self._rule_based_checks(cycle_spec, proposal)
+        logger.debug(f"Rule-based checks found {len(rule_issues)} issues")
 
         # If no LLM, return rule-based result
         if self.llm is None:
             approved = len(rule_issues) == 0
+            logger.info(f"No LLM provided, rule-based validation: approved={approved}")
             report = ValidationReport(
                 approved=approved,
                 decision="APPROVED" if approved else "NEEDS_REVISION",
@@ -220,11 +230,14 @@ Only output the JSON object, nothing else.
 
         # LLM-based review
         prompt = self._build_prompt(cycle_spec, description, proposal)
+        logger.debug(f"Built validation prompt with {len(prompt)} chars")
 
         try:
+            logger.info("Calling LLM for semantic validation")
             response = call_llm(self.llm, prompt)
             text = response if isinstance(response, str) else json.dumps(response)
             parsed = self._parse_llm_response(text)
+            logger.debug(f"LLM decision: {parsed.get('decision', 'unknown')}")
 
             # Merge rule-based issues with parsed issues
             parsed_issues = [
@@ -235,6 +248,7 @@ Only output the JSON object, nothing else.
             decision = parsed.get("decision", "NEEDS_REVISION")
             approved = decision == "APPROVED" and len(all_issues) == 0
 
+            logger.info(f"ValidatorAgent completed: decision={decision}, approved={approved}, issues={len(all_issues)}")
             report = ValidationReport(
                 approved=approved,
                 decision=decision if approved else "NEEDS_REVISION",
@@ -245,6 +259,7 @@ Only output the JSON object, nothing else.
             return AgentResult(status="success", output=report.model_dump())
 
         except Exception as e:
+            logger.error(f"LLM call failed: {e}", exc_info=True)
             return AgentResult(
                 status="error", output=None, logs=f"LLM call failed: {e}"
             )
