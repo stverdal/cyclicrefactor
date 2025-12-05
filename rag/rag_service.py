@@ -175,6 +175,7 @@ class RAGService:
         """
         vectorstore = self._get_vectorstore()
         if vectorstore is None:
+            logger.warning("Vector store not available for scored query")
             return []
         
         num_results = k or self.search_kwargs.get("k", 4)
@@ -184,7 +185,14 @@ class RAGService:
                 query_text,
                 k=num_results
             )
-            logger.debug(f"Query returned {len(results)} results with scores")
+            
+            if results:
+                # Log score range for debugging
+                scores = [score for _, score in results]
+                logger.debug(f"Query returned {len(results)} results, score range: {min(scores):.3f} - {max(scores):.3f}")
+            else:
+                logger.debug("Query returned 0 results")
+            
             return results
         except Exception as e:
             logger.error(f"Query with scores failed: {e}")

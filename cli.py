@@ -23,7 +23,16 @@ def main():
     if args.log_level:
         log_config["level"] = args.log_level
     logger = configure_from_config(log_config)
-    logger.info(f"Pipeline starting with config: {args.config}")
+    
+    logger.info("="*60)
+    logger.info("CYCLE REFACTORING PIPELINE")
+    logger.info("="*60)
+    logger.info(f"Config file: {args.config}")
+    logger.info(f"Input file: {args.input_json}")
+    if args.cycle_id:
+        logger.info(f"Target cycle ID: {args.cycle_id}")
+    logger.info(f"LLM provider: {cfg.llm.provider if cfg.llm else 'none'}")
+    logger.info(f"LLM model: {cfg.llm.model if cfg.llm else 'none'}")
 
     with open(args.input_json, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -37,9 +46,45 @@ def main():
     prompt = cycle_spec.metadata.get("prompt") if cycle_spec.metadata else None
     results = orch.run_pipeline(cycle_spec, prompt=prompt)
 
-    logger.info(f"Pipeline completed: status={results.get('status')}, iterations={results.get('iterations')}")
-    print("Description:\n", results.get("description"))
-    print("Proposal:\n", results.get("proposal"))
+    # Print summary
+    logger.info("="*60)
+    logger.info("PIPELINE COMPLETE")
+    logger.info("="*60)
+    status = results.get('status', 'unknown')
+    iterations = results.get('iterations', 0)
+    
+    if status == 'approved':
+        logger.info(f"✓ Status: APPROVED after {iterations} iteration(s)")
+    elif status == 'max_iterations_reached':
+        logger.warning(f"⚠ Status: MAX ITERATIONS REACHED ({iterations})")
+    elif status == 'error':
+        logger.error(f"✗ Status: ERROR - {results.get('error', 'unknown error')}")
+    else:
+        logger.info(f"Status: {status} after {iterations} iteration(s)")
+    
+    # Show artifacts location
+    artifact_dir = f"{cfg.io.artifacts_dir}/{cycle_spec.id}"
+    logger.info(f"Artifacts saved to: {artifact_dir}")
+    
+    print("\n" + "="*60)
+    print("RESULTS SUMMARY")
+    print("="*60)
+    
+    # Description summary
+    desc = results.get("description", {})
+    if isinstance(desc, dict) and desc.get("text"):
+        print(f"\nDescription:\n{desc['text'][:500]}{'...' if len(desc.get('text', '')) > 500 else ''}")
+    
+    # Proposal summary
+    proposal = results.get("proposal", {})
+    if isinstance(proposal, dict) and proposal.get("patches"):
+        patches = proposal["patches"]
+        changed = [p for p in patches if p.get("diff")]
+        print(f"\nProposal: {len(changed)}/{len(patches)} files modified")
+        for p in changed[:5]:
+            print(f"  - {p.get('path')}")
+        if len(changed) > 5:
+            print(f"  ... and {len(changed) - 5} more")
 
 
 if __name__ == "__main__":

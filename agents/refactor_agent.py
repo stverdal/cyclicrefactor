@@ -31,22 +31,39 @@ class RefactorAgent(Agent):
     def _get_rag_context(self, cycle: CycleSpec) -> str:
         """Retrieve relevant context from RAG for refactoring guidance."""
         if self.rag_service is None:
+            logger.debug("RAG service not available, skipping context retrieval")
             return ""
         
         try:
             # Query for refactoring patterns and best practices
+            # Different query than Describer - focused on HOW to fix rather than WHAT the problem is
             nodes = ", ".join(cycle.graph.nodes[:5])
             query = f"dependency inversion refactoring patterns {nodes}"
             
-            context = self.rag_service.get_relevant_context(
-                query,
-                k=3,
-                max_length=2000
-            )
+            logger.info(f"RAG Query: '{query}'")
+            logger.info("Purpose: Find refactoring patterns and best practices for breaking this cycle")
             
-            if context:
-                logger.debug(f"Retrieved RAG context for refactoring: {len(context)} chars")
+            # Use query_with_scores to get relevance information
+            results = self.rag_service.query_with_scores(query, k=3)
+            
+            if results:
+                logger.info(f"RAG Results: {len(results)} document(s) retrieved")
+                for i, (doc, score) in enumerate(results, 1):
+                    source = doc.metadata.get('source_file', 'unknown')
+                    preview = doc.page_content[:100].replace('\n', ' ').strip()
+                    logger.info(f"  [{i}] {source} (score: {score:.3f})")
+                    logger.debug(f"      Preview: {preview}...")
+                
+                # Format context from documents
+                context = self.rag_service.format_context(
+                    [doc for doc, _ in results],
+                    max_length=2000
+                )
+                logger.debug(f"RAG context formatted: {len(context)} chars")
                 return context
+            else:
+                logger.info("RAG Results: No relevant documents found")
+                
         except Exception as e:
             logger.warning(f"Failed to retrieve RAG context: {e}")
         

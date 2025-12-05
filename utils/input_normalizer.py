@@ -2,6 +2,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from models.schemas import CycleSpec, FileSpec, GraphSpec
+from utils.logging import get_logger
+
+logger = get_logger("input_normalizer")
 
 
 def _normalize_edges(edges_raw: List[Any]) -> List[List[str]]:
@@ -43,17 +46,27 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
 
     if isinstance(raw, dict) and "cycles" in raw and isinstance(raw["cycles"], list):
         cycles = raw["cycles"]
+        logger.info(f"Input contains {len(cycles)} cycle(s)")
         if cycle_id:
             cycle = next((c for c in cycles if c.get("id") == cycle_id), None)
+            if cycle:
+                logger.info(f"Selected cycle by ID: {cycle_id}")
+            else:
+                logger.warning(f"Cycle ID '{cycle_id}' not found, available IDs: {[c.get('id') for c in cycles]}")
         if cycle is None and cycles:
             cycle = cycles[0]
+            logger.info(f"Using first cycle: {cycle.get('id', 'unknown')}")
         # Check for project root path
         project_info = raw.get("project", {})
         project_root = project_info.get("root")
+        if project_root:
+            logger.debug(f"Project root: {project_root}")
     else:
         cycle = raw
+        logger.debug("Input is a single cycle object")
 
     if cycle is None:
+        logger.error("No cycle found in input JSON")
         raise ValueError("No cycle found in input JSON")
 
     # Detect format and normalize
@@ -83,11 +96,19 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
 
     # Load file contents if needed
     files = []
+    files_loaded = 0
+    files_missing = 0
+    files_embedded = 0
+    
     for f in files_raw:
         path = f.get("path")
         content = f.get("content")
 
-        if (not content or content is None) and read_files and path:
+        if content:
+            # Content already embedded in JSON
+            files_embedded += 1
+            logger.debug(f"Using embedded content for: {path}")
+        elif read_files and path:
             try:
                 # Try path as-is first
                 p = Path(path)
@@ -100,12 +121,27 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
 
                 if p.is_file():
                     content = p.read_text(encoding="utf-8")
+                    files_loaded += 1
+                    logger.debug(f"Loaded file: {p} ({len(content)} chars)")
                 else:
+                    files_missing += 1
+                    logger.warning(f"File not found: {path}")
                     content = ""
-            except Exception:
+            except Exception as e:
+                files_missing += 1
+                logger.warning(f"Failed to read file {path}: {e}")
                 content = ""
+        else:
+            if not read_files:
+                logger.debug(f"Skipping file read (--no-read-files): {path}")
+            content = ""
 
         files.append(FileSpec(path=path or "", content=content or ""))
+    
+    # Summary log for file loading
+    logger.info(f"Files: {len(files)} total, {files_loaded} loaded from disk, {files_embedded} embedded, {files_missing} missing")
+    if files_missing > 0:
+        logger.warning(f"{files_missing} file(s) could not be read - patches may be incomplete")
 
     # Build metadata
     metadata = cycle.get("metadata", {})
@@ -118,9 +154,15 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
         }
 
     # Return validated CycleSpec model
-    return CycleSpec(
+    spec = CycleSpec(
         id=cycle.get("id") or "",
         graph=graph,
         files=files,
         metadata=metadata,
     )
+    
+    logger.info(f"Normalized cycle '{spec.id}': {len(spec.graph.nodes)} nodes, {len(spec.graph.edges)} edges, {len(spec.files)} files")
+    if spec.graph.nodes:
+        logger.info(f"Nodes in cycle: {', '.join(spec.graph.nodes[:5])}{'...' if len(spec.graph.nodes) > 5 else ''}")
+    
+    return spec
