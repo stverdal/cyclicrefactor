@@ -58,7 +58,9 @@ Based on the recommended strategy:
 
 ## Output Format
 
-Return a JSON object:
+Choose the format based on file size:
+
+### Option 1: Full Content JSON (for small files < 100 lines)
 ```json
 {
   "reasoning": "<1-2 sentences explaining your approach>",
@@ -73,16 +75,48 @@ Return a JSON object:
 }
 ```
 
-OR use file markers:
+### Option 2: SEARCH/REPLACE JSON (PREFERRED for large files)
+For files over 100 lines, use targeted changes instead of full content:
+```json
+{
+  "reasoning": "<1-2 sentences explaining your approach>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
+  "changes": [
+    {
+      "path": "path/to/file.ext",
+      "search_replace": [
+        {
+          "search": "<exact text to find - include 2-3 context lines>",
+          "replace": "<replacement text>"
+        }
+      ]
+    }
+  ],
+  "notes": "<any additional notes>"
+}
+```
+
+### Option 3: File Markers with SEARCH/REPLACE
 ```
 --- FILE: path/to/file.ext ---
-<COMPLETE file content>
+<<<<<<< SEARCH
+original code block to find
+=======
+replacement code block
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+another block to change
+=======
+its replacement
+>>>>>>> REPLACE
 ```
 
 ## Critical Requirements
-1. Include **COMPLETE** file content in each patch (not just diffs)
-2. Ensure all imports are valid after refactoring
-3. Preserve existing public APIs and functionality
-4. Actually REMOVE or INVERT the problematic dependency
+1. For SEARCH/REPLACE: Include enough context (2-3 lines before/after) to uniquely identify the location
+2. SEARCH text must match EXACTLY (including whitespace and indentation)
+3. Ensure all imports are valid after refactoring
+4. Preserve existing public APIs and functionality
+5. Actually REMOVE or INVERT the problematic dependency
 
 Only output the JSON or file markers, no additional commentary.

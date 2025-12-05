@@ -347,33 +347,60 @@ Before writing code, reason through:
 3. PLAN: What minimal changes break the cycle without breaking functionality?
 4. IMPLEMENT: Write the patches
 
-## Output Format
-Return a JSON object with your patches:
+## Output Format - CHOOSE ONE:
+
+### Option A: For SMALL files (< 100 lines) - Full content
 ```json
 {
-  "reasoning": "<brief explanation of your approach>",
+  "reasoning": "<brief explanation>",
   "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
   "patches": [
-    {
-      "path": "path/to/file.ext",
-      "patched": "<COMPLETE file content after refactoring>"
-    }
-  ],
-  "notes": "<any additional notes>"
+    {"path": "path/to/file.ext", "patched": "<COMPLETE file content>"}
+  ]
 }
 ```
 
-OR use file markers:
+### Option B: For LARGE files - Use SEARCH/REPLACE blocks (PREFERRED)
+```json
+{
+  "reasoning": "<brief explanation>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
+  "changes": [
+    {
+      "path": "path/to/file.ext",
+      "search_replace": [
+        {
+          "search": "<exact text to find, 3-5 lines of context>",
+          "replace": "<replacement text>"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Option C: Use file markers with SEARCH/REPLACE
 ```
 --- FILE: path/to/file.ext ---
-<COMPLETE file content after refactoring>
+<<<<<<< SEARCH
+using OldNamespace;
+=======
+using NewNamespace;
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+public class Foo : IOldInterface
+=======
+public class Foo : INewInterface
+>>>>>>> REPLACE
 ```
 
 ## Critical Requirements
-1. Include COMPLETE file content (not just changes)
-2. Ensure all imports are correct after changes
-3. Preserve existing functionality
-4. Remove or invert the problematic dependency
+1. For large files, use SEARCH/REPLACE blocks (Option B or C) - this prevents truncation
+2. Include enough context in SEARCH blocks to be unique (3-5 lines before/after)
+3. Ensure all brackets/braces are balanced in your output
+4. Preserve existing functionality
+5. DO NOT truncate your output - if file is too large, use SEARCH/REPLACE
 """
         return prompt
 
@@ -607,30 +634,239 @@ OR use file markers:
         return patches
 
     def _parse_marker_patches(self, text: str) -> List[Dict[str, str]]:
-        # Split by marker lines like '--- FILE: path ---'
+        """Parse file marker format, handling both full content and SEARCH/REPLACE blocks."""
         pattern = r"--- FILE: (.+?) ---\n"
         parts = re.split(pattern, text)
-        # re.split will produce [pre, path1, content1, path2, content2, ...]
         patches = []
         if len(parts) < 3:
             return patches
+        
         # drop leading preamble
         it = iter(parts[1:])
         for path, content in zip(it, it):
-            patches.append({"path": path.strip(), "patched": content.strip()})
+            path = path.strip()
+            content = content.strip()
+            
+            # Check if content contains SEARCH/REPLACE blocks
+            if "<<<<<<< SEARCH" in content and ">>>>>>> REPLACE" in content:
+                patches.append({
+                    "path": path,
+                    "search_replace_blocks": content,  # Will be processed later
+                    "patched": None  # Indicates we need to apply search/replace
+                })
+            else:
+                patches.append({"path": path, "patched": content})
+        
         return patches
 
-    def _infer_patches(self, llm_response: Any, cycle_files: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """Parse patches from LLM response using multiple strategies."""
+    def _parse_search_replace_json(self, text: str) -> List[Dict[str, Any]]:
+        """Parse JSON format with search_replace changes instead of full patches."""
+        try:
+            # Strip markdown wrapper
+            text = text.strip()
+            if text.startswith("```"):
+                first_newline = text.find("\n")
+                text = text[first_newline + 1:] if first_newline != -1 else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            
+            # Try to parse JSON
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if not json_match:
+                return []
+            
+            data = json.loads(json_match.group())
+            changes = data.get("changes", [])
+            
+            if not changes:
+                return []
+            
+            result = []
+            for change in changes:
+                path = change.get("path")
+                search_replace = change.get("search_replace", [])
+                if path and search_replace:
+                    result.append({
+                        "path": path,
+                        "search_replace": search_replace
+                    })
+            
+            return result
+        except Exception as e:
+            logger.debug(f"Failed to parse search_replace JSON: {e}")
+            return []
+
+    def _apply_search_replace(self, original: str, search_replace_blocks: str) -> str:
+        """Apply SEARCH/REPLACE blocks to original content.
+        
+        Format:
+        <<<<<<< SEARCH
+        old text
+        =======
+        new text
+        >>>>>>> REPLACE
+        """
+        result = original
+        
+        # Normalize line endings for consistent matching
+        result = result.replace('\r\n', '\n')
+        search_replace_blocks = search_replace_blocks.replace('\r\n', '\n')
+        
+        # Parse SEARCH/REPLACE blocks
+        pattern = r'<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE'
+        matches = re.findall(pattern, search_replace_blocks)
+        
+        if not matches:
+            logger.warning("No SEARCH/REPLACE blocks found in content")
+            return original
+        
+        applied_count = 0
+        for search_text, replace_text in matches:
+            # Strategy 1: Exact match
+            if search_text in result:
+                result = result.replace(search_text, replace_text, 1)
+                applied_count += 1
+                logger.debug(f"Applied exact search/replace: {len(search_text)} chars -> {len(replace_text)} chars")
+                continue
+            
+            # Strategy 2: Strip trailing whitespace from each line and try again
+            search_lines = [line.rstrip() for line in search_text.split('\n')]
+            result_lines = result.split('\n')
+            result_lines_stripped = [line.rstrip() for line in result_lines]
+            
+            # Find the starting line
+            found = False
+            for i in range(len(result_lines_stripped) - len(search_lines) + 1):
+                if result_lines_stripped[i:i + len(search_lines)] == search_lines:
+                    # Found match - replace these lines
+                    new_lines = result_lines[:i] + replace_text.split('\n') + result_lines[i + len(search_lines):]
+                    result = '\n'.join(new_lines)
+                    applied_count += 1
+                    found = True
+                    logger.debug(f"Applied whitespace-normalized search/replace at line {i}")
+                    break
+            
+            if found:
+                continue
+            
+            # Strategy 3: Anchor-based matching (first and last non-empty lines)
+            non_empty_search = [l.strip() for l in search_lines if l.strip()]
+            if len(non_empty_search) >= 2:
+                first_anchor = non_empty_search[0]
+                last_anchor = non_empty_search[-1]
+                
+                start_idx = None
+                end_idx = None
+                
+                for i, line in enumerate(result_lines):
+                    stripped = line.strip()
+                    if stripped == first_anchor and start_idx is None:
+                        start_idx = i
+                    elif start_idx is not None and stripped == last_anchor:
+                        end_idx = i
+                        break
+                
+                if start_idx is not None and end_idx is not None and end_idx > start_idx:
+                    new_lines = result_lines[:start_idx] + replace_text.split('\n') + result_lines[end_idx + 1:]
+                    result = '\n'.join(new_lines)
+                    applied_count += 1
+                    logger.debug(f"Applied anchor-based search/replace at lines {start_idx}-{end_idx}")
+                    continue
+            
+            logger.warning(f"Search text not found in file: {search_text[:100]}...")
+        
+        logger.info(f"Applied {applied_count}/{len(matches)} search/replace blocks")
+        return result
+
+    def _apply_search_replace_list(self, original: str, search_replace_list: List[Dict[str, str]]) -> str:
+        """Apply a list of search/replace operations from JSON format."""
+        result = original.replace('\r\n', '\n')  # Normalize line endings
+        applied_count = 0
+        
+        for sr in search_replace_list:
+            search_text = sr.get("search", "").replace('\r\n', '\n')
+            replace_text = sr.get("replace", "").replace('\r\n', '\n')
+            
+            if not search_text:
+                continue
+            
+            # Strategy 1: Exact match
+            if search_text in result:
+                result = result.replace(search_text, replace_text, 1)
+                applied_count += 1
+                logger.debug(f"Applied exact search/replace: {len(search_text)} chars -> {len(replace_text)} chars")
+                continue
+            
+            # Strategy 2: Line-by-line with stripped whitespace
+            search_lines = [line.rstrip() for line in search_text.split('\n')]
+            result_lines = result.split('\n')
+            result_lines_stripped = [line.rstrip() for line in result_lines]
+            
+            found = False
+            for i in range(len(result_lines_stripped) - len(search_lines) + 1):
+                if result_lines_stripped[i:i + len(search_lines)] == search_lines:
+                    new_lines = result_lines[:i] + replace_text.split('\n') + result_lines[i + len(search_lines):]
+                    result = '\n'.join(new_lines)
+                    applied_count += 1
+                    found = True
+                    logger.debug(f"Applied whitespace-normalized search/replace at line {i}")
+                    break
+            
+            if found:
+                continue
+            
+            # Strategy 3: Anchor-based (first and last non-empty lines)
+            non_empty_search = [l.strip() for l in search_lines if l.strip()]
+            if len(non_empty_search) >= 2:
+                first_anchor = non_empty_search[0]
+                last_anchor = non_empty_search[-1]
+                
+                start_idx = None
+                end_idx = None
+                
+                for i, line in enumerate(result_lines):
+                    stripped = line.strip()
+                    if stripped == first_anchor and start_idx is None:
+                        start_idx = i
+                    elif start_idx is not None and stripped == last_anchor:
+                        end_idx = i
+                        break
+                
+                if start_idx is not None and end_idx is not None and end_idx > start_idx:
+                    new_lines = result_lines[:start_idx] + replace_text.split('\n') + result_lines[end_idx + 1:]
+                    result = '\n'.join(new_lines)
+                    applied_count += 1
+                    logger.debug(f"Applied anchor-based search/replace at lines {start_idx}-{end_idx}")
+                    continue
+            
+            logger.warning(f"Search text not found: {search_text[:80]}...")
+        
+        logger.info(f"Applied {applied_count}/{len(search_replace_list)} search/replace operations")
+        return result
+
+    def _infer_patches(self, llm_response: Any, cycle_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Parse patches from LLM response using multiple strategies.
+        
+        Returns list of dicts with either:
+        - {"path": str, "patched": str} for full content patches
+        - {"path": str, "search_replace_blocks": str} for marker-style S/R
+        - {"path": str, "search_replace": List[Dict]} for JSON-style S/R
+        """
         text = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
 
-        # Try structured JSON first
+        # Try structured JSON first (handles both full patches and search_replace format)
         patches = self._parse_json_patches(text)
         if patches:
             logger.debug(f"Parsed {len(patches)} patches from JSON format")
             return patches
 
-        # Try marker format
+        # Try JSON with search_replace changes
+        patches = self._parse_search_replace_json(text)
+        if patches:
+            logger.debug(f"Parsed {len(patches)} search/replace patches from JSON format")
+            return patches
+
+        # Try marker format (handles both full content and SEARCH/REPLACE blocks)
         patches = self._parse_marker_patches(text)
         if patches:
             logger.debug(f"Parsed {len(patches)} patches from marker format")
@@ -647,6 +883,57 @@ OR use file markers:
         patched_lines = patched.splitlines(keepends=True)
         diff = difflib.unified_diff(orig_lines, patched_lines, fromfile=f"a/{path}", tofile=f"b/{path}")
         return "".join(diff)
+
+    def _check_for_truncation(self, content: str, path: str) -> bool:
+        """Check if content appears to be truncated (unbalanced brackets).
+        
+        Returns True if truncation is detected.
+        """
+        if not content:
+            return False
+        
+        # Count brackets
+        open_braces = content.count('{')
+        close_braces = content.count('}')
+        open_parens = content.count('(')
+        close_parens = content.count(')')
+        open_brackets = content.count('[')
+        close_brackets = content.count(']')
+        
+        # Check for significant imbalance
+        brace_diff = open_braces - close_braces
+        paren_diff = open_parens - close_parens
+        bracket_diff = open_brackets - close_brackets
+        
+        if abs(brace_diff) > 1:
+            logger.warning(f"Possible truncation in {path}: unbalanced braces {{}} ({open_braces} open, {close_braces} close)")
+            return True
+        if abs(paren_diff) > 2:  # Allow more leeway for parentheses
+            logger.warning(f"Possible truncation in {path}: unbalanced parentheses () ({open_parens} open, {close_parens} close)")
+            return True
+        if abs(bracket_diff) > 1:
+            logger.warning(f"Possible truncation in {path}: unbalanced brackets [] ({open_brackets} open, {close_brackets} close)")
+            return True
+        
+        # Check if file ends abruptly (common truncation patterns)
+        content_stripped = content.rstrip()
+        truncation_indicators = [
+            # Incomplete statements
+            content_stripped.endswith(','),
+            content_stripped.endswith('('),
+            content_stripped.endswith('{'),
+            content_stripped.endswith('['),
+            content_stripped.endswith(':'),
+            # Incomplete strings
+            content_stripped.count('"') % 2 != 0,
+            content_stripped.count("'") % 2 != 0,
+        ]
+        
+        if any(truncation_indicators):
+            logger.warning(f"Possible truncation in {path}: file ends with incomplete construct")
+            return True
+        
+        return False
 
     def run(
         self,
@@ -771,7 +1058,33 @@ OR use file markers:
                 if patched_entry is None:
                     logger.warning(f"No patch found for {path} (basename: {basename})")
 
-                patched = patched_entry.get("patched") if patched_entry else original
+                # Determine patched content - handle both full patches and search/replace
+                if patched_entry:
+                    if patched_entry.get("patched"):
+                        # Full patched content provided
+                        patched = patched_entry.get("patched")
+                    elif patched_entry.get("search_replace_blocks"):
+                        # Marker-style SEARCH/REPLACE blocks
+                        patched = self._apply_search_replace(
+                            original, patched_entry.get("search_replace_blocks")
+                        )
+                        logger.debug(f"Applied marker-style search/replace to {path}")
+                    elif patched_entry.get("search_replace"):
+                        # JSON-style search_replace list
+                        patched = self._apply_search_replace_list(
+                            original, patched_entry.get("search_replace")
+                        )
+                        logger.debug(f"Applied JSON-style search/replace to {path}")
+                    else:
+                        # Entry exists but no content - keep original
+                        patched = original
+                else:
+                    patched = original
+
+                # Check for truncation - if detected, revert to original
+                if patched != original and self._check_for_truncation(patched, path):
+                    logger.warning(f"Truncation detected in {path}, reverting to original")
+                    patched = original
 
                 diff = self._make_unified_diff(original, patched, path) if patched != original else ""
                 if diff:
