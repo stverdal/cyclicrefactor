@@ -1,43 +1,192 @@
 Scaffold for agentic LangChain pipeline
 
+## Overview
+
+This pipeline analyzes and refactors cyclic dependencies in codebases using a multi-agent architecture:
+
+1. **Describer Agent** - Analyzes the cycle and produces a human-readable description
+2. **Refactor Agent** - Proposes code patches to break/reduce the cycle
+3. **Validator Agent** - Validates the proposed changes (linting, syntax checks)
+4. **Explainer Agent** - Generates documentation for the refactoring
+
+## Project Structure
+
 - `cli.py`: CLI entrypoint. Run with `python cli.py example_cycle.json`.
-- `orchestrator.py`: Simple in-process orchestrator that runs Describer then Refactor.
+- `orchestrator.py`: In-process orchestrator that runs the agent pipeline.
 - `agents/`: Agent implementations and base class.
 - `models/schemas.py`: Pydantic schemas for CycleSpec, CycleDescription, and RefactorProposal.
+- `rag/`: RAG (Retrieval-Augmented Generation) module for PDF knowledge base.
+- `utils/`: Utility modules (logging, persistence, prompt loading).
+- `config.yml`: Configuration file for LLM, pipeline settings, and RAG.
 
-Next steps:
-- Implement LLM calls inside `agents/describer.py` and `agents/refactor_agent.py`.
-- Add persistence of artifacts and provenance.
-- Add validators and iterative loop support.
+## Quick Setup
 
-Quick setup (virtualenv)
- - Create and activate a virtual environment (Windows PowerShell):
+### 1. Create Virtual Environment
 
+**Windows PowerShell:**
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
- - On macOS / Linux:
-
+**Linux / macOS:**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install dependencies:
+### 2. Install Dependencies
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Run the CLI (example):
+### 3. Install and Configure Ollama (Local LLM)
+
+This pipeline is designed for **air-gapped environments** - all inference runs locally.
+
+**Linux:**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &  # Start the server
+ollama pull qwen2.5-coder:7b  # Or your preferred model
+```
+
+**Windows:**
+Download from https://ollama.com/download and install. Then:
+```powershell
+ollama pull qwen2.5-coder:7b
+```
+
+Update `config.yml` to use Ollama:
+```yaml
+llm:
+  provider: ollama
+  model: qwen2.5-coder:7b
+```
+
+## RAG Module Setup
+
+The RAG (Retrieval-Augmented Generation) module allows agents to retrieve relevant context from PDF documents (architecture guides, refactoring patterns, etc.) during the pipeline run.
+
+### 1. Add PDF Documents
+
+Place your PDF reference documents in the `data/pdf/` folder:
+```
+data/
+└── pdf/
+    ├── architecture_patterns.pdf
+    ├── refactoring_guide.pdf
+    └── ...
+```
+
+### 2. Index the Documents
+
+Run the PDF indexer to create embeddings and store them in ChromaDB:
+
+```bash
+python -m rag.pdf_indexer --data-dir data/pdf --persist-dir cache/chroma_db
+```
+
+**Options:**
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir` | `data/pdf` | Directory containing PDF files |
+| `--persist-dir` | `cache/chroma_db` | Where to store the vector database |
+| `--embedding-provider` | `huggingface` | `huggingface` (local) or `ollama` |
+| `--embedding-model` | `all-MiniLM-L6-v2` | Model for generating embeddings |
+| `--chunk-size` | `1000` | Characters per text chunk |
+| `--chunk-overlap` | `200` | Overlap between chunks |
+| `--collection` | `architecture_docs` | ChromaDB collection name |
+
+**Example with Ollama embeddings:**
+```bash
+python -m rag.pdf_indexer \
+  --embedding-provider ollama \
+  --embedding-model nomic-embed-text
+```
+
+### 3. Configure RAG in config.yml
+
+```yaml
+retriever:
+  type: chroma
+  persist_dir: cache/chroma_db
+  data_dir: data/pdf
+  embedding_provider: huggingface  # or 'ollama'
+  embedding_model: all-MiniLM-L6-v2
+  collection_name: architecture_docs
+  search_type: similarity  # or 'mmr' for diversity
+  search_kwargs:
+    k: 4  # Number of documents to retrieve
+```
+
+### 4. Verify RAG is Working
+
+```python
+from config import load_config
+from rag.rag_service import RAGService
+
+config = load_config()
+service = RAGService(config.retriever)
+
+print(f"Available: {service.is_available()}")
+results = service.query("dependency inversion principle", k=2)
+print(f"Found {len(results)} results")
+```
+
+## Running the Pipeline
+
+### Basic Usage
 
 ```bash
 python cli.py example_cycle.json --config config.yml
 ```
 
-Notes:
-- If your input JSON references absolute file paths, run the tool on the machine with access to those paths or embed file contents in the JSON and use `--no-read-files`.
-- Keep API keys in environment variables (see `config.yml` for expected names).
+### Using the Orchestrator Directly
+
+```python
+from config import load_config
+from orchestrator import Orchestrator
+
+config = load_config("config.yml")
+orch = Orchestrator(config=config)
+
+cycle_spec = {
+    "id": "cycle-001",
+    "graph": {
+        "nodes": ["ModuleA", "ModuleB"],
+        "edges": [["ModuleA", "ModuleB"], ["ModuleB", "ModuleA"]]
+    },
+    "files": [
+        {"path": "src/ModuleA.cs", "content": "..."},
+        {"path": "src/ModuleB.cs", "content": "..."}
+    ]
+}
+
+results = orch.run_pipeline(cycle_spec)
+```
+
+## Output Artifacts
+
+All outputs are saved to the `artifacts/` directory (source files are **never modified**):
+
+```
+artifacts/
+└── {cycle-id}/
+    ├── input/cycle_spec.json       # Original input
+    ├── describer/description.txt   # Cycle description
+    ├── proposal/proposal.json      # Refactoring proposal
+    ├── patches/{file_path}         # Patched file versions
+    ├── diffs/{file_path}.diff      # Unified diffs
+    ├── validation/report.json      # Validation results
+    └── explanation/explanation.md  # Human-readable summary
+```
+
+## Notes
+
+- **Air-gapped operation**: No external API calls - all LLM inference and embeddings run locally via Ollama or HuggingFace.
+- **Read-only**: Source files are never modified. Patches are stored in `artifacts/`.
+- If your input JSON references absolute file paths, run the tool on the machine with access to those paths or embed file contents in the JSON.
+- Logs are written to `langCodeUnderstanding.log` (configurable in `config.yml`).

@@ -1,7 +1,26 @@
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from models.schemas import CycleSpec, FileSpec, GraphSpec
+
+
+def _normalize_edges(edges_raw: List[Any]) -> List[List[str]]:
+    """Convert various edge formats to canonical [source, target] lists.
+    
+    Supports:
+    - [source, target] lists (pass through)
+    - {"source": ..., "target": ...} objects (convert to list)
+    """
+    edges = []
+    for e in edges_raw:
+        if isinstance(e, list) and len(e) >= 2:
+            # Already in [source, target] format
+            edges.append([str(e[0]), str(e[1])])
+        elif isinstance(e, dict) and "source" in e and "target" in e:
+            # Object format: {source, target, relation?}
+            edges.append([str(e["source"]), str(e["target"])])
+        # Skip invalid entries
+    return edges
 
 
 def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_files: bool = True) -> CycleSpec:
@@ -12,6 +31,7 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
     Supported input formats:
     1. Legacy format with `nodes` array containing {id, path, content} objects
     2. New format with separate `graph` and `files` arrays
+    3. Cycle detector format with nodes as {id, type, name, path} and edges as {source, target, relation}
 
     - If `raw` contains a top-level `cycles` array, select the cycle by `cycle_id` or first element.
     - For each file, prefer an inlined `content` field; otherwise try to read the file at `path` if `read_files` is True.
@@ -41,14 +61,17 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
         # New format: graph and files are separate
         graph_raw = cycle.get("graph", {})
         nodes = graph_raw.get("nodes", [])
-        edges = graph_raw.get("edges", [])
+        edges_raw = graph_raw.get("edges", [])
+        edges = _normalize_edges(edges_raw)
         files_raw = cycle.get("files", [])
     elif "nodes" in cycle:
-        # Legacy format: nodes array with {id, path, content}
+        # Legacy/cycle-detector format: nodes array with {id, path, ...} or {id, type, name, path}
         nodes_raw = cycle.get("nodes", [])
-        nodes = [n.get("id") for n in nodes_raw if isinstance(n, dict)]
-        edges = cycle.get("edges", [])
-        files_raw = [{"path": n.get("path"), "content": n.get("content")} for n in nodes_raw if isinstance(n, dict)]
+        nodes = [n.get("id") or n.get("name") for n in nodes_raw if isinstance(n, dict)]
+        edges_raw = cycle.get("edges", [])
+        edges = _normalize_edges(edges_raw)
+        # Extract file info from nodes
+        files_raw = [{"path": n.get("path"), "content": n.get("content")} for n in nodes_raw if isinstance(n, dict) and n.get("path")]
     else:
         # Fallback: assume it's already canonical
         nodes = []
