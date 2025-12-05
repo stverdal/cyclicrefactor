@@ -315,7 +315,9 @@ class ValidatorAgent(Agent):
             if re.search(r'^\s*def\s+\w+[^:]*$', content, re.MULTILINE):
                 issues.append(ValidationIssue(
                     path=path, line=None, 
-                    comment="Possible missing colon after function definition"
+                    comment="Possible missing colon after function definition",
+                    severity="major",
+                    issue_type="syntax"
                 ))
         
         elif ext == 'cs':
@@ -349,7 +351,9 @@ class ValidatorAgent(Agent):
             if open_count != close_count:
                 issues.append(ValidationIssue(
                     path=path, line=None,
-                    comment=f"Unbalanced '{open_char}{close_char}': {open_count} open, {close_count} close"
+                    comment=f"Unbalanced '{open_char}{close_char}': {open_count} open, {close_count} close",
+                    severity="critical",
+                    issue_type="syntax"
                 ))
         return issues
     
@@ -397,7 +401,10 @@ class ValidatorAgent(Agent):
                 issues.append(ValidationIssue(
                     path="(cycle analysis)",
                     line=None,
-                    comment="Changes detected but no direct references between cycle nodes were removed. Verify cycle is actually broken."
+                    comment="Changes detected but no direct references between cycle nodes were removed. Verify cycle is actually broken.",
+                    severity="major",
+                    issue_type="cycle"
+                ))
                 ))
         
         return observations, issues
@@ -424,21 +431,24 @@ class ValidatorAgent(Agent):
                 pth.split("/")[-1] for pth in known_paths
             }:
                 issues.append(
-                    ValidationIssue(path=path, line=None, comment="Patch targets unknown file")
+                    ValidationIssue(path=path, line=None, comment="Patch targets unknown file",
+                                   severity="major", issue_type="semantic")
                 )
                 logger.warning(f"Patch targets unknown file: {path}")
             
             # Check non-empty patched content
             if not p.patched:
                 issues.append(
-                    ValidationIssue(path=path, line=None, comment="Patched content is empty")
+                    ValidationIssue(path=path, line=None, comment="Patched content is empty",
+                                   severity="critical", issue_type="syntax")
                 )
                 logger.warning(f"Patch is empty: {path}")
             
             # Check diff exists (i.e., something changed)
             if p.original == p.patched:
                 issues.append(
-                    ValidationIssue(path=path, line=None, comment="No changes detected in patch")
+                    ValidationIssue(path=path, line=None, comment="No changes detected in patch",
+                                   severity="minor", issue_type="semantic")
                 )
                 logger.debug(f"No changes in patch: {path}")
             else:

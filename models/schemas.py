@@ -100,6 +100,8 @@ class ValidationIssue(BaseModel):
     path: str = ""
     line: Optional[int] = None
     comment: str = ""
+    severity: str = "major"  # critical, major, minor, info
+    issue_type: str = "semantic"  # syntax, semantic, cycle
 
 
 class ValidationReport(BaseModel):

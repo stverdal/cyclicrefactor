@@ -218,17 +218,48 @@ After:
         """Build prompt with strategy guidance, examples, and chain-of-thought.
         
         Uses context budget management to optimize for limited context window.
+        Adapts budget based on feedback type (syntax vs semantic errors).
         """
         file_paths = cycle.get_file_paths()
         cycle_dict = cycle.model_dump()
         has_feedback = feedback is not None
         
-        # Create context budget for this agent
+        # Analyze feedback to determine issue types
+        has_syntax_errors = False
+        has_cycle_issues = False
+        syntax_error_files = set()
+        
+        if feedback and feedback.issues:
+            for issue in feedback.issues:
+                issue_type = getattr(issue, 'issue_type', 'semantic')
+                if issue_type == 'syntax':
+                    has_syntax_errors = True
+                    if issue.path:
+                        syntax_error_files.add(issue.path)
+                elif issue_type == 'cycle':
+                    has_cycle_issues = True
+        
+        # Log the feedback classification
+        if has_feedback:
+            logger.info(f"Feedback analysis: syntax_errors={has_syntax_errors}, cycle_issues={has_cycle_issues}, syntax_files={len(syntax_error_files)}")
+        
+        # Create context budget - adjust based on feedback type
+        # If only syntax errors, skip RAG and give more room to files
+        skip_rag = has_syntax_errors and not has_cycle_issues
+        
         budget = create_budget_for_agent(
             "refactor", 
             total_tokens=self.context_window,
             has_feedback=has_feedback
         )
+        
+        # If we have syntax errors, reallocate RAG budget to file content
+        if skip_rag:
+            rag_budget = budget.get_token_budget(BudgetCategory.RAG_CONTEXT)
+            logger.info(f"Syntax errors detected - reallocating {rag_budget} RAG tokens to file content")
+            # Zero out RAG and add to file content
+            budget.allocations[BudgetCategory.RAG_CONTEXT] = 0
+            budget.allocations[BudgetCategory.FILE_CONTENT] += rag_budget / self.context_window
         
         # Get validation issues for file prioritization (if retry)
         validation_issues = None
@@ -243,6 +274,19 @@ After:
             validation_issues=validation_issues,
             total_char_budget=budget.get_char_budget(BudgetCategory.FILE_CONTENT),
         )
+        
+        # If we have syntax errors, boost priority of files with errors
+        if syntax_error_files:
+            for fp in file_priorities:
+                # Check if this file has syntax errors (match by basename)
+                basename = fp.path.split('/')[-1].split('\\')[-1]
+                for err_path in syntax_error_files:
+                    err_basename = err_path.split('/')[-1].split('\\')[-1]
+                    if basename == err_basename:
+                        fp.priority_score = 1.0  # Maximum priority
+                        fp.reason = "syntax_error_file"
+                        logger.debug(f"Boosted priority for syntax error file: {fp.path}")
+                        break
         
         # Build file snippets with priority-based budgets
         snippets = []
@@ -277,14 +321,20 @@ After:
         budget.use_budget(BudgetCategory.FILE_CONTENT, total_file_tokens)
         logger.debug(f"File content: {total_file_tokens} tokens used across {len(snippets)} files")
         
-        # Get RAG context with budget limit
-        rag_token_budget = budget.get_token_budget(BudgetCategory.RAG_CONTEXT)
-        rag_context = self._get_rag_context(cycle, strategy, description)
-        if rag_context:
-            rag_context = truncate_to_token_budget(rag_context, rag_token_budget, "prose")
+        # Get RAG context with budget limit (skip if we have syntax errors)
+        rag_context = ""
+        if skip_rag:
+            logger.info("Skipping RAG context due to syntax errors - focusing on file content")
+        else:
+            rag_token_budget = budget.get_token_budget(BudgetCategory.RAG_CONTEXT)
+            rag_context = self._get_rag_context(cycle, strategy, description)
+            if rag_context:
+                rag_context = truncate_to_token_budget(rag_context, rag_token_budget, "prose")
         
-        # Get pattern example (fits in examples budget)
-        pattern_example = self._get_pattern_example(strategy)
+        # Get pattern example (skip if we have syntax errors - focus on fixing the code)
+        pattern_example = ""
+        if not skip_rag:
+            pattern_example = self._get_pattern_example(strategy)
 
         if self.prompt_template:
             tpl = load_template(self.prompt_template)
@@ -405,12 +455,47 @@ public class Foo : INewInterface
         return prompt
 
     def _format_feedback(self, feedback: ValidationReport) -> str:
-        """Format validator feedback for retry prompt."""
-        result = "\n\n## ⚠️ Previous Attempt Failed - Address These Issues:\n"
+        """Format validator feedback for retry prompt.
+        
+        Categorizes issues by type and provides focused instructions.
+        """
+        # Categorize issues
+        syntax_issues = []
+        cycle_issues = []
+        semantic_issues = []
         
         for issue in feedback.issues:
-            line_info = f" (line {issue.line})" if issue.line else ""
-            result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
+            issue_type = getattr(issue, 'issue_type', 'semantic')
+            if issue_type == 'syntax':
+                syntax_issues.append(issue)
+            elif issue_type == 'cycle':
+                cycle_issues.append(issue)
+            else:
+                semantic_issues.append(issue)
+        
+        result = "\n\n## ⚠️ Previous Attempt Failed - Address These Issues:\n"
+        
+        # Syntax errors first (highest priority)
+        if syntax_issues:
+            result += "\n### 🔴 CRITICAL - Syntax Errors (Fix First!):\n"
+            result += "Your previous output had truncated or malformed code. Use SEARCH/REPLACE format for large files.\n\n"
+            for issue in syntax_issues:
+                line_info = f" (line {issue.line})" if issue.line else ""
+                result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
+            result += "\n**To fix:** Use targeted SEARCH/REPLACE blocks instead of outputting entire files.\n"
+        
+        # Cycle issues
+        if cycle_issues:
+            result += "\n### 🟠 Cycle Not Broken:\n"
+            for issue in cycle_issues:
+                result += f"- {issue.comment}\n"
+        
+        # Other semantic issues
+        if semantic_issues:
+            result += "\n### 🟡 Other Issues:\n"
+            for issue in semantic_issues:
+                line_info = f" (line {issue.line})" if issue.line else ""
+                result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
         
         if feedback.suggestions:
             result += "\n**Suggestions:**\n"
