@@ -335,16 +335,46 @@ OR use file markers:
         return result
 
     def _parse_json_patches(self, text: str) -> List[Dict[str, str]]:
+        """Parse patches from JSON format in LLM response."""
         try:
-            data = json.loads(text)
+            # Try to find JSON object in the response
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if not json_match:
+                logger.debug("No JSON object found in response")
+                return []
+            
+            json_str = json_match.group()
+            data = json.loads(json_str)
+            
             patches = []
-            for p in data.get("patches", []):
+            raw_patches = data.get("patches", [])
+            
+            if not raw_patches:
+                logger.debug("JSON parsed but no 'patches' array found")
+                return []
+            
+            for p in raw_patches:
+                path = p.get("path")
+                patched = p.get("patched")
+                
+                if not path:
+                    logger.warning("Patch missing 'path' field")
+                    continue
+                if not patched:
+                    logger.warning(f"Patch for {path} missing 'patched' content")
+                    continue
+                    
                 patches.append({
-                    "path": p.get("path"),
-                    "patched": p.get("patched")
+                    "path": path,
+                    "patched": patched
                 })
+            
             return patches
-        except Exception:
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON parse failed: {e}")
+            return []
+        except Exception as e:
+            logger.debug(f"JSON extraction failed: {e}")
             return []
 
     def _parse_marker_patches(self, text: str) -> List[Dict[str, str]]:
@@ -362,17 +392,24 @@ OR use file markers:
         return patches
 
     def _infer_patches(self, llm_response: Any, cycle_files: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        # Try structured JSON first
+        """Parse patches from LLM response using multiple strategies."""
         text = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
 
+        # Try structured JSON first
         patches = self._parse_json_patches(text)
         if patches:
+            logger.debug(f"Parsed {len(patches)} patches from JSON format")
             return patches
 
+        # Try marker format
         patches = self._parse_marker_patches(text)
         if patches:
+            logger.debug(f"Parsed {len(patches)} patches from marker format")
             return patches
 
+        # Log the first part of response to help debug parsing issues
+        logger.warning(f"Could not parse patches from LLM response. First 500 chars: {text[:500]}")
+        
         # Nothing parsed: return empty => no-op
         return []
 
@@ -463,14 +500,47 @@ OR use file markers:
             # Build final patches list merging originals with patched content
             patches_out = []
             files_changed = 0
+            
+            # Log what patches were inferred for debugging
+            if inferred:
+                inferred_paths = [p.get("path", "unknown") for p in inferred]
+                logger.info(f"Inferred patches for paths: {inferred_paths}")
+            else:
+                logger.warning("No patches inferred from LLM response - check if LLM returned valid output")
+            
             for f in cycle_spec.files:
                 path = f.path
                 original = f.content or ""
+                
+                # Try multiple matching strategies
+                patched_entry = None
+                
+                # 1. Exact path match
                 patched_entry = next((p for p in inferred if p.get("path") == path), None)
+                
                 if patched_entry is None:
-                    # try basename match
+                    # 2. Basename match (just the filename)
                     basename = path.split("/")[-1]
-                    patched_entry = next((p for p in inferred if p.get("path") == basename), None)
+                    patched_entry = next((p for p in inferred if p.get("path", "").endswith(basename)), None)
+                
+                if patched_entry is None:
+                    # 3. Partial path match (e.g., "Stores/ISensorStore.cs" matches "/full/path/Stores/ISensorStore.cs")
+                    for p in inferred:
+                        inferred_path = p.get("path", "")
+                        if inferred_path and (path.endswith(inferred_path) or inferred_path.endswith(basename)):
+                            patched_entry = p
+                            break
+                
+                if patched_entry is None:
+                    # 4. Case-insensitive basename match (for Windows paths vs Linux paths)
+                    basename_lower = basename.lower()
+                    patched_entry = next(
+                        (p for p in inferred if p.get("path", "").lower().endswith(basename_lower)), 
+                        None
+                    )
+                
+                if patched_entry is None:
+                    logger.warning(f"No patch found for {path} (basename: {basename})")
 
                 patched = patched_entry.get("patched") if patched_entry else original
 
