@@ -230,6 +230,7 @@ class Orchestrator:
                     prompt_template=self._get_prompt_template("validator"),
                     linters=getattr(self.config, "validator", {}).get("linters") if hasattr(self.config, "validator") else None,
                     test_command=getattr(self.config, "validator", {}).get("test_command") if hasattr(self.config, "validator") else None,
+                    rag_service=self.rag_service,
                 )
                 # Convert proposal to RefactorProposal model if needed
                 proposal = ref_result.output

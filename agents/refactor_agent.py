@@ -4,6 +4,7 @@ from .llm_utils import call_llm
 from utils.snippet_selector import select_relevant_snippet
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
+from utils.rag_query_builder import RAGQueryBuilder, QueryIntent, CycleAnalysis
 from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport
 import json
 import difflib
@@ -13,8 +14,68 @@ logger = get_logger("refactor")
 
 
 class RefactorAgent(Agent):
+    """Proposes code patches to break cyclic dependencies.
+    
+    This agent:
+    1. Extracts strategy hints from the Describer's output
+    2. Queries RAG for implementation guidance (using conceptual terms)
+    3. Includes mini-examples of refactoring patterns in prompts
+    4. Uses chain-of-thought reasoning for complex cycles
+    """
+    
     name = "refactor"
-    version = "0.6"
+    version = "0.7"
+
+    # Mini-examples of refactoring patterns (language-agnostic concepts)
+    PATTERN_EXAMPLES = {
+        "interface_extraction": """
+**Interface Extraction Pattern**
+Before:
+  ClassA imports ClassB (uses methods directly)
+  ClassB imports ClassA (uses methods directly)
+  
+After:
+  Create IClassB interface with methods ClassA needs
+  ClassB implements IClassB
+  ClassA depends on IClassB (not ClassB)
+  Cycle broken: ClassB no longer needs to import ClassA
+""",
+        "dependency_inversion": """
+**Dependency Inversion Pattern**
+Before:
+  HighLevelModule imports LowLevelModule directly
+  
+After:
+  Create IService interface in HighLevelModule's layer
+  LowLevelModule implements IService
+  HighLevelModule depends on IService abstraction
+  Dependency direction inverted
+""",
+        "shared_module": """
+**Shared Module Extraction Pattern**
+Before:
+  ModuleA imports ModuleB (for shared utility)
+  ModuleB imports ModuleA (for shared utility)
+  
+After:
+  Create SharedModule with common functionality
+  ModuleA imports SharedModule
+  ModuleB imports SharedModule
+  ModuleA and ModuleB no longer import each other
+""",
+        "mediator": """
+**Mediator Pattern**
+Before:
+  ComponentA imports ComponentB (direct communication)
+  ComponentB imports ComponentA (direct communication)
+  
+After:
+  Create Mediator class
+  ComponentA and ComponentB both depend on Mediator
+  Mediator coordinates communication between them
+  No direct dependencies between A and B
+""",
+    }
 
     def __init__(
         self,
@@ -27,93 +88,130 @@ class RefactorAgent(Agent):
         self.prompt_template = prompt_template
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
+        self.query_builder = RAGQueryBuilder()
+
+    def _extract_strategy_from_description(self, description: CycleDescription) -> Optional[str]:
+        """Extract the recommended strategy from the Describer's output."""
+        text = description.text.lower()
+        
+        strategy_keywords = {
+            "interface_extraction": ["interface extraction", "extract interface", "create interface", "iservice"],
+            "dependency_inversion": ["dependency inversion", "invert dependency", "inversion of control"],
+            "shared_module": ["shared module", "common module", "extract shared", "move to common"],
+            "mediator": ["mediator", "coordinator", "event bus"],
+        }
+        
+        for strategy, keywords in strategy_keywords.items():
+            for keyword in keywords:
+                if keyword in text:
+                    logger.info(f"Detected strategy hint from description: {strategy}")
+                    return strategy
+        
+        # Default based on common patterns in text
+        if "bidirectional" in text or "mutual" in text:
+            return "interface_extraction"
+        if "layer" in text or "violation" in text:
+            return "dependency_inversion"
+        
+        return None
     
-    def _get_rag_context(self, cycle: CycleSpec) -> str:
-        """Retrieve relevant context from RAG for refactoring guidance."""
+    def _get_rag_context(self, cycle: CycleSpec, strategy: Optional[str], description: CycleDescription) -> str:
+        """Retrieve implementation-focused context from RAG."""
         if self.rag_service is None:
             logger.debug("RAG service not available, skipping context retrieval")
             return ""
         
         try:
-            # Query for refactoring patterns and best practices
-            # Different query than Describer - focused on HOW to fix rather than WHAT the problem is
-            nodes = ", ".join(cycle.graph.nodes[:5])
-            query = f"dependency inversion refactoring patterns {nodes}"
+            cycle_dict = cycle.model_dump()
             
-            logger.info(f"RAG Query: '{query}'")
-            logger.info("Purpose: Find refactoring patterns and best practices for breaking this cycle")
+            # Build implementation-focused queries
+            queries = self.query_builder.build_queries_for_cycle(
+                cycle_dict, 
+                QueryIntent.IMPLEMENT,
+                description.text  # Pass description as hints
+            )
             
-            # Use query_with_scores to get relevance information
-            results = self.rag_service.query_with_scores(query, k=3)
+            # Add strategy-specific query if we know the strategy
+            if strategy:
+                strategy_queries = {
+                    "interface_extraction": "how to extract interface break dependency example",
+                    "dependency_inversion": "implementing dependency inversion principle example",
+                    "shared_module": "extract common module reduce coupling example",
+                    "mediator": "mediator pattern implementation example",
+                }
+                if strategy in strategy_queries:
+                    queries.insert(0, strategy_queries[strategy])
             
-            if results:
-                logger.info(f"RAG Results: {len(results)} document(s) retrieved")
-                for i, (doc, score) in enumerate(results, 1):
-                    source = doc.metadata.get('source_file', 'unknown')
-                    preview = doc.page_content[:100].replace('\n', ' ').strip()
-                    logger.info(f"  [{i}] {source} (score: {score:.3f})")
-                    logger.debug(f"      Preview: {preview}...")
+            all_results = []
+            seen_content = set()
+            
+            for query in queries[:3]:  # Limit queries
+                logger.info(f"RAG Query: '{query}'")
+                logger.info("Purpose: Find implementation guidance for refactoring")
                 
-                # Format context from documents
-                context = self.rag_service.format_context(
-                    [doc for doc, _ in results],
-                    max_length=2000
-                )
-                logger.debug(f"RAG context formatted: {len(context)} chars")
-                return context
+                results = self.rag_service.query_with_scores(query, k=2)
+                
+                if results:
+                    for doc, score in results:
+                        content_hash = hash(doc.page_content[:200])
+                        if content_hash not in seen_content:
+                            seen_content.add(content_hash)
+                            all_results.append((doc, score))
+                            source = doc.metadata.get('source_file', 'unknown')
+                            logger.info(f"  Retrieved: {source} (score: {score:.3f})")
+            
+            if all_results:
+                logger.info(f"RAG total: {len(all_results)} unique document(s) for implementation")
+                all_results.sort(key=lambda x: x[1])
+                
+                context_parts = []
+                for doc, score in all_results[:3]:
+                    source = doc.metadata.get('source_file', 'unknown')
+                    context_parts.append(f"[{source}]\n{doc.page_content[:500]}")
+                
+                return "\n\n---\n\n".join(context_parts)
             else:
-                logger.info("RAG Results: No relevant documents found")
+                logger.info("RAG: No implementation guidance found")
                 
         except Exception as e:
             logger.warning(f"Failed to retrieve RAG context: {e}")
         
         return ""
 
+    def _get_pattern_example(self, strategy: Optional[str]) -> str:
+        """Get a mini-example for the recommended strategy."""
+        if strategy and strategy in self.PATTERN_EXAMPLES:
+            return self.PATTERN_EXAMPLES[strategy]
+        
+        # Return general examples if no specific strategy
+        return """
+**Common Refactoring Patterns:**
+
+1. Interface Extraction: Create an interface that one module implements,
+   and the other module depends on the interface instead of the concrete class.
+
+2. Dependency Inversion: Ensure high-level modules don't depend on low-level modules.
+   Both should depend on abstractions.
+
+3. Extract Shared Module: Move common code to a new module that both can import,
+   eliminating direct dependencies between the original modules.
+"""
+
     def _build_prompt(self, cycle: CycleSpec, description: CycleDescription) -> str:
-        file_paths = cycle.get_file_paths()
-        if self.prompt_template:
-            try:
-                return self.prompt_template.format(
-                    id=cycle.id,
-                    graph=json.dumps(cycle.graph.model_dump()),
-                    files=", ".join(file_paths),
-                    description=description.text,
-                )
-            except Exception:
-                pass
+        """Basic prompt builder (kept for compatibility)."""
+        return self._build_prompt_with_strategy(cycle, description, None, None)
 
-        base = f"You are a refactoring assistant. The cyclic dependency: {description.text}.\nFiles: {', '.join(file_paths)}.\nPlease propose refactorings and return patched file contents."
-
-        snippets = []
-        for f in cycle.files:
-            content = f.content or ""
-            if len(content) > self.max_file_chars:
-                content = content[: self.max_file_chars] + "\n...[truncated]"
-            snippets.append(f"--- FILE: {f.path} ---\n{content}")
-
-        if snippets:
-            base += "\n\n" + "\n\n".join(snippets)
-
-        base += "\n\nReturn results either as JSON: {\"patches\": [{\"path\":..., \"patched\": ...}], \"notes\":...} or as plain text with markers '--- FILE: <path> ---' followed by patched content."
-
-        return base
-
-    def _build_prompt_with_snippets(
+    def _build_prompt_with_strategy(
         self,
         cycle: CycleSpec,
         description: CycleDescription,
         feedback: Optional[ValidationReport] = None,
+        strategy: Optional[str] = None,
     ) -> str:
-        """Build prompt with selected file snippets, template-file support, and optional validator feedback.
-
-        Args:
-            cycle: CycleSpec model with id, graph, files.
-            description: CycleDescription model with 'text'.
-            feedback: Optional ValidationReport for retry.
-        """
+        """Build prompt with strategy guidance, examples, and chain-of-thought."""
         file_paths = cycle.get_file_paths()
 
-        # Prepare file content snippets using shared utility for relevant regions
+        # Prepare file content snippets
         snippets = []
         cycle_dict = cycle.model_dump()
         for f in cycle.files:
@@ -123,8 +221,11 @@ class RefactorAgent(Agent):
 
         file_snippets = "\n\n".join(snippets) if snippets else ""
         
-        # Get RAG context for refactoring guidance
-        rag_context = self._get_rag_context(cycle)
+        # Get RAG context with strategy focus
+        rag_context = self._get_rag_context(cycle, strategy, description)
+        
+        # Get pattern example
+        pattern_example = self._get_pattern_example(strategy)
 
         if self.prompt_template:
             tpl = load_template(self.prompt_template)
@@ -136,49 +237,102 @@ class RefactorAgent(Agent):
                 description=description.text,
                 file_snippets=file_snippets,
                 rag_context=rag_context,
+                pattern_example=pattern_example,
+                strategy=strategy or "not specified",
             )
             # Append snippets if template didn't include them
             contains_file_blocks = any((f"--- FILE: {p}" in result) for p in file_paths)
             if file_snippets and "{file_snippets}" not in tpl and not contains_file_blocks:
                 result = result + "\n\n" + file_snippets
             
-            # Append RAG context if template didn't include it
-            if rag_context and "{rag_context}" not in tpl:
-                result = result + "\n\n--- REFERENCE MATERIALS ---\n" + rag_context
-            
             # Append feedback if provided
             if feedback:
-                result += "\n\n## Previous Attempt Feedback\n"
-                result += "Your previous proposal was rejected. Please address these issues:\n"
-                for issue in feedback.issues:
-                    line_info = f" (line {issue.line})" if issue.line else ""
-                    result += f"- {issue.path}{line_info}: {issue.comment}\n"
-                for suggestion in feedback.suggestions:
-                    result += f"- Suggestion: {suggestion}\n"
+                result += self._format_feedback(feedback)
             return result
 
-        base = f"You are a refactoring assistant. The cyclic dependency: {description.text}.\nFiles: {', '.join(file_paths)}.\nPlease propose refactorings and return patched file contents."
+        # Default prompt with chain-of-thought structure
+        prompt = f"""You are a refactoring expert. Break the cyclic dependency described below.
 
-        if file_snippets:
-            base += "\n\n" + file_snippets
-        
-        # Include RAG context for reference
+## Cycle Information
+- ID: {cycle.id}
+- Nodes: {', '.join(cycle.graph.nodes)}
+- Edges: {json.dumps(cycle.graph.edges)}
+- Files: {', '.join(file_paths)}
+
+## Problem Description (from analysis)
+{description.text[:2000]}
+
+## Recommended Strategy: {strategy or "Choose the most appropriate"}
+
+{pattern_example}
+
+## Source Code
+{file_snippets}
+"""
+
         if rag_context:
-            base += "\n\n--- REFERENCE MATERIALS ---\n" + rag_context
+            prompt += f"""
+## Reference (from architecture literature)
+{rag_context[:1500]}
+"""
 
-        # Include validator feedback if this is a retry
         if feedback:
-            base += "\n\n## Previous Attempt Feedback\n"
-            base += "Your previous proposal was rejected. Please address these issues:\n"
-            for issue in feedback.issues:
-                line_info = f" (line {issue.line})" if issue.line else ""
-                base += f"- {issue.path}{line_info}: {issue.comment}\n"
+            prompt += self._format_feedback(feedback)
+
+        prompt += """
+## IMPORTANT: Think Step-by-Step
+
+Before writing code, reason through:
+1. IDENTIFY: Which specific import/reference creates the problematic edge?
+2. STRATEGY: Which pattern applies? (interface extraction, dependency inversion, shared module)
+3. PLAN: What minimal changes break the cycle without breaking functionality?
+4. IMPLEMENT: Write the patches
+
+## Output Format
+Return a JSON object with your patches:
+```json
+{
+  "reasoning": "<brief explanation of your approach>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
+  "patches": [
+    {
+      "path": "path/to/file.ext",
+      "patched": "<COMPLETE file content after refactoring>"
+    }
+  ],
+  "notes": "<any additional notes>"
+}
+```
+
+OR use file markers:
+```
+--- FILE: path/to/file.ext ---
+<COMPLETE file content after refactoring>
+```
+
+## Critical Requirements
+1. Include COMPLETE file content (not just changes)
+2. Ensure all imports are correct after changes
+3. Preserve existing functionality
+4. Remove or invert the problematic dependency
+"""
+        return prompt
+
+    def _format_feedback(self, feedback: ValidationReport) -> str:
+        """Format validator feedback for retry prompt."""
+        result = "\n\n## ⚠️ Previous Attempt Failed - Address These Issues:\n"
+        
+        for issue in feedback.issues:
+            line_info = f" (line {issue.line})" if issue.line else ""
+            result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
+        
+        if feedback.suggestions:
+            result += "\n**Suggestions:**\n"
             for suggestion in feedback.suggestions:
-                base += f"- Suggestion: {suggestion}\n"
-
-        base += "\n\nReturn results either as JSON: {\"patches\": [{\"path\":..., \"patched\": ...}], \"notes\":...} or as plain text with markers '--- FILE: <path> ---' followed by patched content."
-
-        return base
+                result += f"- {suggestion}\n"
+        
+        result += "\nPlease fix these issues in your new proposal.\n"
+        return result
 
     def _parse_json_patches(self, text: str) -> List[Dict[str, str]]:
         try:
@@ -235,7 +389,7 @@ class RefactorAgent(Agent):
         validator_feedback: Optional[Union[ValidationReport, Dict[str, Any]]] = None,
         prompt: str = None,
     ) -> AgentResult:
-        """Propose patches to break the cycle.
+        """Propose patches to break the cycle using strategy-aware refactoring.
 
         Args:
             cycle_spec: CycleSpec model or dict with id, graph, files.
@@ -260,8 +414,17 @@ class RefactorAgent(Agent):
             validator_feedback = ValidationReport.model_validate(validator_feedback)
             logger.info(f"Retry with feedback: {len(validator_feedback.issues)} issues, {len(validator_feedback.suggestions)} suggestions")
 
-        # Use enhanced prompt builder that includes selected file snippets and feedback
-        prompt_text = self._build_prompt_with_snippets(cycle_spec, description, validator_feedback)
+        # Extract strategy hint from description
+        strategy = self._extract_strategy_from_description(description)
+        if strategy:
+            logger.info(f"Using strategy: {strategy}")
+        else:
+            logger.info("No specific strategy detected, will use general approach")
+
+        # Build strategy-aware prompt
+        prompt_text = self._build_prompt_with_strategy(
+            cycle_spec, description, validator_feedback, strategy
+        )
         logger.debug(f"Built refactor prompt with {len(prompt_text)} chars")
 
         # If no LLM available just return original files as no-op patches
@@ -284,7 +447,20 @@ class RefactorAgent(Agent):
             inferred = self._infer_patches(llm_response, files_dict)
             logger.debug(f"Inferred {len(inferred)} patches from LLM response")
 
-            # Build final patches list merging originals with patched content (if present)
+            # Try to extract strategy from response
+            try:
+                text = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
+                json_match = re.search(r'\{[\s\S]*\}', text)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    if "strategy_used" in parsed:
+                        logger.info(f"LLM used strategy: {parsed['strategy_used']}")
+                    if "reasoning" in parsed:
+                        logger.debug(f"LLM reasoning: {parsed['reasoning'][:200]}...")
+            except Exception:
+                pass
+
+            # Build final patches list merging originals with patched content
             patches_out = []
             files_changed = 0
             for f in cycle_spec.files:
@@ -308,7 +484,7 @@ class RefactorAgent(Agent):
             logger.info(f"RefactorAgent completed: {files_changed}/{len(patches_out)} files changed")
             proposal = RefactorProposal(
                 patches=patches_out,
-                rationale="LLM produced proposal",
+                rationale=f"LLM proposal using strategy: {strategy or 'auto-selected'}",
                 llm_response=llm_response if isinstance(llm_response, str) else json.dumps(llm_response),
             )
             return AgentResult(status="success", output=proposal.model_dump())

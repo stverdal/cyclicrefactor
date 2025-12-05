@@ -5,6 +5,7 @@ from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
+from utils.rag_query_builder import RAGQueryBuilder, QueryIntent
 from models.schemas import (
     CycleSpec,
     CycleDescription,
@@ -16,16 +17,26 @@ from models.schemas import (
 logger = get_logger("validator")
 
 
-class ValidatorAgent(Agent):
-    """Validates refactor proposals against the cycle/description and returns approval or feedback.
+class IssueSeverity:
+    """Issue severity levels for prioritization."""
+    CRITICAL = "critical"  # Blocks approval (syntax errors, broken imports)
+    MAJOR = "major"        # Strongly suggests rejection (cycle not broken)
+    MINOR = "minor"        # Suggestions for improvement (style, naming)
+    INFO = "info"          # Observations, not issues
 
-    When an LLM is provided the validator asks the model to review the proposal
-    and decide whether the cycle is addressed. If not, it returns structured
-    feedback with inline comments so the refactor agent can retry.
+
+class ValidatorAgent(Agent):
+    """Validates refactor proposals and provides actionable feedback.
+
+    This agent:
+    1. Performs rule-based checks (syntax, imports, cycle impact)
+    2. Uses LLM for semantic validation
+    3. Categorizes issues by severity
+    4. Provides specific, actionable suggestions for retry
     """
 
     name = "validator"
-    version = "0.3"
+    version = "0.4"
 
     def __init__(
         self,
@@ -34,6 +45,7 @@ class ValidatorAgent(Agent):
         linters: Dict[str, str] = None,
         test_command: str = None,
         max_file_chars: int = 4000,
+        rag_service=None,
     ):
         """
         Args:
@@ -42,12 +54,15 @@ class ValidatorAgent(Agent):
             linters: Mapping of linter name to shell command (future integration).
             test_command: Shell command to run tests (future integration).
             max_file_chars: Truncation limit per file snippet.
+            rag_service: Optional RAG service for validation criteria.
         """
         self.llm = llm
         self.prompt_template = prompt_template
         self.linters = linters or {}
         self.test_command = test_command
         self.max_file_chars = max_file_chars
+        self.rag_service = rag_service
+        self.query_builder = RAGQueryBuilder()
 
     # -------------------------------------------------------------------------
     # Prompt building
@@ -118,13 +133,14 @@ class ValidatorAgent(Agent):
 ## Changes ({files_changed} files modified, {files_unchanged} unchanged)
 {diffs_text}
 
-## Validate
-1. Do the changes break/reduce the cycle? (Check if dependencies are inverted or removed)
-2. Any syntax errors, missing imports, or broken references?
-3. Is the refactor complete or are there remaining cyclic paths?
+## Validation Checklist
+1. **Cycle Broken?** Do the changes remove/invert the problematic dependency?
+2. **Syntax Valid?** Any unbalanced brackets, missing imports, or broken references?
+3. **Complete?** Are there remaining cyclic paths that weren't addressed?
+4. **Functionality Preserved?** Does the refactor maintain existing behavior?
 
 ## Output (JSON only)
-{{"decision": "APPROVED"|"NEEDS_REVISION", "summary": "...", "issues": [{{"path": "...", "line": null, "comment": "..."}}], "suggestions": ["..."]}}
+{{"decision": "APPROVED"|"NEEDS_REVISION", "summary": "...", "issues": [{{"path": "...", "line": null, "comment": "...", "severity": "critical|major|minor"}}], "suggestions": ["<specific actionable fix>"]}}
 """
 
     # -------------------------------------------------------------------------
@@ -148,6 +164,108 @@ class ValidatorAgent(Agent):
             "suggestions": [],
             "raw_response": text,
         }
+
+    # -------------------------------------------------------------------------
+    # Issue categorization and actionable suggestions
+    # -------------------------------------------------------------------------
+
+    def _categorize_issue_severity(self, issue: ValidationIssue) -> str:
+        """Classify issue severity for prioritization."""
+        comment_lower = issue.comment.lower()
+        
+        # Critical: blocks approval
+        critical_patterns = [
+            "syntax error", "unbalanced", "missing import", "broken reference",
+            "undefined", "not found", "cannot resolve"
+        ]
+        for pattern in critical_patterns:
+            if pattern in comment_lower:
+                return IssueSeverity.CRITICAL
+        
+        # Major: strongly suggests rejection
+        major_patterns = [
+            "cycle not broken", "dependency still exists", "incomplete",
+            "no changes", "original unchanged", "still imports"
+        ]
+        for pattern in major_patterns:
+            if pattern in comment_lower:
+                return IssueSeverity.MAJOR
+        
+        # Minor: suggestions
+        minor_patterns = [
+            "naming", "style", "convention", "could be improved",
+            "consider", "optional"
+        ]
+        for pattern in minor_patterns:
+            if pattern in comment_lower:
+                return IssueSeverity.MINOR
+        
+        return IssueSeverity.MAJOR  # Default to major for unknown issues
+
+    def _generate_actionable_suggestions(
+        self,
+        issues: List[ValidationIssue],
+        proposal: RefactorProposal,
+        cycle: CycleSpec,
+    ) -> List[str]:
+        """Generate specific, actionable suggestions based on issues."""
+        suggestions = []
+        
+        # Group issues by type
+        has_no_changes = any("no changes" in i.comment.lower() for i in issues)
+        has_cycle_issue = any("cycle" in i.comment.lower() for i in issues)
+        has_syntax_issue = any("syntax" in i.comment.lower() or "unbalanced" in i.comment.lower() for i in issues)
+        has_import_issue = any("import" in i.comment.lower() for i in issues)
+        
+        if has_no_changes:
+            # Find which files weren't changed
+            unchanged_files = [p.path for p in proposal.patches if not p.diff]
+            if unchanged_files:
+                file_list = ", ".join(unchanged_files[:3])
+                suggestions.append(
+                    f"Files {file_list} were not modified. To break the cycle, you must either: "
+                    f"(1) Extract an interface from one of the cycle members, "
+                    f"(2) Move shared code to a new module, or "
+                    f"(3) Remove the problematic import by restructuring the code."
+                )
+        
+        if has_cycle_issue and not has_no_changes:
+            nodes = cycle.graph.nodes
+            if len(nodes) == 2:
+                suggestions.append(
+                    f"The bidirectional dependency between {nodes[0]} and {nodes[1]} still exists. "
+                    f"Create an interface (e.g., I{nodes[0]}Service) that {nodes[0]} implements, "
+                    f"and have {nodes[1]} depend on the interface instead of the concrete class."
+                )
+            else:
+                suggestions.append(
+                    f"The cycle still exists. Look for the specific import statement in one of the cycle members "
+                    f"that creates the problematic edge, and either remove it, replace it with an interface, "
+                    f"or move the shared functionality to a common module."
+                )
+        
+        if has_syntax_issue:
+            suggestions.append(
+                "Fix the syntax errors first. Ensure all brackets are balanced, "
+                "all statements are properly terminated, and the code is syntactically valid."
+            )
+        
+        if has_import_issue:
+            suggestions.append(
+                "Check that all imports are correct after refactoring. "
+                "If you extracted an interface or moved code, update the import statements accordingly."
+            )
+        
+        # Add general guidance if no specific suggestions
+        if not suggestions:
+            suggestions.append(
+                "Review the issues above and ensure your refactoring: "
+                "(1) Actually modifies the problematic files, "
+                "(2) Removes or inverts the dependency that creates the cycle, "
+                "(3) Maintains valid syntax and imports."
+            )
+        
+        return suggestions
 
     # -------------------------------------------------------------------------
     # Rule-based checks (used when no LLM or as additional layer)
@@ -386,20 +504,33 @@ class ValidatorAgent(Agent):
         rule_issues, observations = self._rule_based_checks(cycle_spec, proposal)
         logger.debug(f"Rule-based checks found {len(rule_issues)} issues, {len(observations)} observations")
 
-        # If no LLM, return rule-based result
+        # If no LLM, return rule-based result with actionable suggestions
         if self.llm is None:
-            approved = len(rule_issues) == 0
-            logger.info(f"No LLM provided, rule-based validation: approved={approved}")
+            # Categorize issues by severity
+            critical_issues = [i for i in rule_issues 
+                             if self._categorize_issue_severity(i) == IssueSeverity.CRITICAL]
+            major_issues = [i for i in rule_issues 
+                          if self._categorize_issue_severity(i) == IssueSeverity.MAJOR]
+            
+            # Approve only if no critical or major issues
+            approved = len(critical_issues) == 0 and len(major_issues) == 0
+            logger.info(f"No LLM provided, rule-based validation: approved={approved} "
+                       f"(critical={len(critical_issues)}, major={len(major_issues)})")
+            
+            # Generate actionable suggestions
+            suggestions = self._generate_actionable_suggestions(rule_issues, proposal, cycle_spec)
+            
             # Include observations in summary for visibility
             summary = "Rule-based validation only (no LLM provided)."
             if observations:
                 summary += " Observations: " + "; ".join(observations[:3])
+            
             report = ValidationReport(
                 approved=approved,
                 decision="APPROVED" if approved else "NEEDS_REVISION",
                 summary=summary,
                 issues=rule_issues,
-                suggestions=["Provide an LLM for semantic review."] if rule_issues else [],
+                suggestions=suggestions,
             )
             return AgentResult(status="success", output=report.model_dump())
 
@@ -427,16 +558,32 @@ class ValidatorAgent(Agent):
                 for i in parsed.get("issues", [])
             ]
             all_issues = rule_issues + parsed_issues
+            
+            # Categorize all issues by severity
+            critical_count = sum(1 for i in all_issues 
+                               if self._categorize_issue_severity(i) == IssueSeverity.CRITICAL)
+            major_count = sum(1 for i in all_issues 
+                            if self._categorize_issue_severity(i) == IssueSeverity.MAJOR)
+            
             decision = parsed.get("decision", "NEEDS_REVISION")
-            approved = decision == "APPROVED" and len(all_issues) == 0
+            # Override approval if there are critical/major issues
+            approved = decision == "APPROVED" and critical_count == 0 and major_count == 0
 
-            logger.info(f"ValidatorAgent completed: decision={decision}, approved={approved}, issues={len(all_issues)}")
+            # Generate actionable suggestions if not approved
+            llm_suggestions = parsed.get("suggestions", [])
+            if not approved and not llm_suggestions:
+                llm_suggestions = self._generate_actionable_suggestions(
+                    all_issues, proposal, cycle_spec
+                )
+
+            logger.info(f"ValidatorAgent completed: decision={decision}, approved={approved}, "
+                       f"issues={len(all_issues)} (critical={critical_count}, major={major_count})")
             report = ValidationReport(
                 approved=approved,
-                decision=decision if approved else "NEEDS_REVISION",
+                decision="APPROVED" if approved else "NEEDS_REVISION",
                 summary=parsed.get("summary", ""),
                 issues=all_issues,
-                suggestions=parsed.get("suggestions", []),
+                suggestions=llm_suggestions,
             )
             return AgentResult(status="success", output=report.model_dump())
 

@@ -7,53 +7,82 @@ You are an expert software engineer specializing in breaking cyclic dependencies
 - Dependency graph: {graph}
 - Affected files: {files}
 
-## Problem Description (from describer)
+## Problem Description (from Describer)
 {description}
+
+## Recommended Strategy: {strategy}
+
+## Pattern Reference
+{pattern_example}
 
 ## Source Code
 {file_snippets}
 
-## Your Task
-Propose concrete code changes to break or significantly reduce this cyclic dependency.
+## Reference Materials (from architecture literature)
+{rag_context}
 
-### Refactoring Strategies to Consider
-1. **Extract Interface/Abstract Base**: Create an abstraction that both modules can depend on
-2. **Dependency Inversion**: Invert the dependency direction using callbacks or events
-3. **Extract Shared Module**: Move shared code to a new module both can import
-4. **Lazy Import**: Use deferred/local imports where appropriate
-5. **Mediator Pattern**: Introduce a mediator to coordinate between modules
+---
 
-### Guidelines
-- Prefer minimal, low-risk changes over large rewrites
-- Preserve existing functionality and public APIs where possible
-- Add comments explaining non-obvious changes
-- Consider backward compatibility
-- If file content is truncated, focus on the visible portions
+## IMPORTANT: Think Step-by-Step Before Coding
+
+### Step 1: IDENTIFY the Problematic Edge
+Which specific import/reference creates the cycle? Look for:
+- `import` or `using` statements between cycle members
+- Type references (inheritance, composition, method parameters)
+- Direct instantiation of cycle member classes
+
+### Step 2: CHOOSE Your Approach
+Based on the recommended strategy:
+
+**If Interface Extraction:**
+- Create a new interface with the methods the dependent class needs
+- Have the original class implement the interface
+- Change the dependent to use the interface type
+
+**If Dependency Inversion:**
+- Create an abstraction in the higher-level module
+- Lower-level module implements the abstraction
+- Higher-level module depends only on abstraction
+
+**If Shared Module:**
+- Identify common code used by both modules
+- Create a new module with zero dependencies on cycle members
+- Move shared code there; update imports
+
+### Step 3: IMPLEMENT the Changes
+- Modify ONLY what's necessary to break the cycle
+- Preserve all existing functionality
+- Ensure all imports are correct after changes
+
+---
 
 ## Output Format
-Return your response as JSON:
-```
+
+Return a JSON object:
+```json
 {
+  "reasoning": "<1-2 sentences explaining your approach>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
   "patches": [
     {
-      "path": "path/to/file.py",
-      "patched": "<complete file content after refactoring>"
+      "path": "path/to/file.ext",
+      "patched": "<COMPLETE file content after refactoring>"
     }
   ],
-  "notes": "<brief explanation of the refactoring approach taken>"
+  "notes": "<any additional notes about the changes>"
 }
 ```
 
-Alternatively, you may use file markers:
+OR use file markers:
 ```
---- FILE: path/to/file.py ---
-<complete file content after refactoring>
-
---- FILE: path/to/another.py ---
-<complete file content after refactoring>
+--- FILE: path/to/file.ext ---
+<COMPLETE file content>
 ```
 
-### Important
-- Include the COMPLETE file content in each patch, not just the changes
-- Ensure all imports are correct after refactoring
-- Do not invent files or code not present in the input
+## Critical Requirements
+1. Include **COMPLETE** file content in each patch (not just diffs)
+2. Ensure all imports are valid after refactoring
+3. Preserve existing public APIs and functionality
+4. Actually REMOVE or INVERT the problematic dependency
+
+Only output the JSON or file markers, no additional commentary.
