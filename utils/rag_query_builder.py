@@ -12,7 +12,7 @@ Usage:
     queries = builder.build_queries_for_cycle(cycle_spec, intent="describe")
 """
 
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import re
@@ -30,6 +30,17 @@ class CycleType(Enum):
     INHERITANCE = "inheritance"          # Involves class inheritance
     LAYER_VIOLATION = "layer_violation"  # Lower layer depends on higher layer
     UNKNOWN = "unknown"
+
+
+class UnbreakableReason(Enum):
+    """Reasons why a cycle might be unbreakable or impractical to break."""
+    NOT_UNBREAKABLE = "not_unbreakable"  # Cycle can likely be broken
+    MUTUAL_RECURSION = "mutual_recursion"  # Fundamental algorithmic recursion
+    CIRCULAR_DATA_STRUCTURE = "circular_data"  # Tree/graph with parent-child refs
+    FRAMEWORK_REQUIREMENT = "framework"  # Framework pattern requires cycle
+    INCOMPLETE_CONTEXT = "incomplete"  # Not enough file content to refactor
+    EXTERNAL_DEPENDENCY = "external"  # Cycle involves unmodifiable code
+    TIGHTLY_COUPLED_BY_DESIGN = "by_design"  # Intentional tight coupling
 
 
 class QueryIntent(Enum):
@@ -440,6 +451,264 @@ class RAGQueryBuilder:
                 "lazy", "deferred", "on demand", "late binding"
             ],
         }
+
+    def detect_unbreakable_cycle(
+        self, cycle_spec: Dict[str, Any], validation_history: List[Dict[str, Any]] = None
+    ) -> Tuple[bool, UnbreakableReason, str]:
+        """
+        Detect if a cycle is likely unbreakable or impractical to break.
+        
+        Args:
+            cycle_spec: Cycle specification dict
+            validation_history: List of previous validation results (for pattern detection)
+            
+        Returns:
+            Tuple of (is_unbreakable, reason, explanation)
+        """
+        graph = cycle_spec.get("graph", {})
+        nodes = graph.get("nodes", [])
+        files = cycle_spec.get("files", [])
+        
+        # Combine all file content for analysis
+        all_content = " ".join(f.get("content", "") for f in files if f.get("content"))
+        content_lower = all_content.lower()
+        
+        # Check 1: Incomplete context (not enough content to refactor)
+        total_content_len = sum(len(f.get("content", "")) for f in files)
+        if total_content_len < 100:  # Very little content
+            return (
+                True, 
+                UnbreakableReason.INCOMPLETE_CONTEXT,
+                f"Insufficient file content provided ({total_content_len} chars). "
+                "Cannot analyze dependencies without seeing the actual code."
+            )
+        
+        # Check for truncated files
+        truncated_markers = ["...", "[truncated]", "/* lines", "// lines"]
+        truncated_files = [
+            f.get("path", "unknown") for f in files 
+            if any(m in f.get("content", "").lower() for m in truncated_markers)
+        ]
+        if len(truncated_files) >= len(files) * 0.5:  # More than half truncated
+            return (
+                True,
+                UnbreakableReason.INCOMPLETE_CONTEXT,
+                f"Most files appear to be truncated: {', '.join(truncated_files[:3])}. "
+                "Cannot safely refactor without seeing complete file content."
+            )
+        
+        # Check 2: Mutual recursion patterns
+        mutual_recursion_patterns = [
+            (r'\bParser\b.*\bLexer\b|\bLexer\b.*\bParser\b', "parser-lexer recursion"),
+            (r'\bvisitor\b.*\bnode\b|\bnode\b.*\bvisitor\b', "visitor pattern"),
+            (r'\bExpr.*\beval.*\bExpr\b', "expression evaluation recursion"),
+            (r'\bserializ.*\bdeserializ', "serialization pair"),
+        ]
+        for pattern, description in mutual_recursion_patterns:
+            if re.search(pattern, all_content, re.IGNORECASE):
+                return (
+                    True,
+                    UnbreakableReason.MUTUAL_RECURSION,
+                    f"Detected fundamental mutual recursion pattern ({description}). "
+                    "This is an algorithmic design that inherently requires bidirectional references. "
+                    "Consider documenting this as an intentional architectural decision rather than tech debt."
+                )
+        
+        # Check 3: Circular data structures
+        circular_data_patterns = [
+            (r'\.parent\b.*\.children\b|\.children\b.*\.parent\b', "tree structure"),
+            (r'\.next\b.*\.prev\b|\.prev\b.*\.next\b', "doubly-linked list"),
+            (r'\.owner\b.*\.owned\b|\.owned\b.*\.owner\b', "ownership graph"),
+        ]
+        for pattern, description in circular_data_patterns:
+            if re.search(pattern, content_lower):
+                return (
+                    True,
+                    UnbreakableReason.CIRCULAR_DATA_STRUCTURE,
+                    f"Detected circular data structure ({description}). "
+                    "Bidirectional references in data models are often intentional and necessary. "
+                    "Consider if the cycle is in the data model (acceptable) vs. the module imports (problematic)."
+                )
+        
+        # Check 4: Framework requirements (common patterns that require cycles)
+        framework_patterns = [
+            (r'\bINotifyPropertyChanged\b', "WPF/MVVM data binding"),
+            (r'\bOnPropertyChanged\b', "WPF/MVVM data binding"),
+            (r'\bViewModelBase\b.*\bView\b', "MVVM pattern"),
+            (r'@Component.*@Autowired|@Autowired.*@Component', "Spring circular injection"),
+            (r'\bDbContext\b.*\bDbSet\b', "Entity Framework navigation"),
+        ]
+        for pattern, description in framework_patterns:
+            if re.search(pattern, all_content, re.IGNORECASE):
+                return (
+                    True,
+                    UnbreakableReason.FRAMEWORK_REQUIREMENT,
+                    f"Detected framework pattern that may require this cycle ({description}). "
+                    "Some frameworks intentionally create bidirectional relationships. "
+                    "Check if this is a framework convention before attempting to break it."
+                )
+        
+        # Check 5: Repeated validation failures with same issues (after multiple attempts)
+        if validation_history and len(validation_history) >= 2:
+            # Check if the same issues keep appearing
+            issues_per_run = []
+            for val in validation_history:
+                issues = val.get("issues", [])
+                issue_comments = frozenset(
+                    i.get("comment", "")[:50] for i in issues if isinstance(i, dict)
+                )
+                issues_per_run.append(issue_comments)
+            
+            # If the same issues appear in all runs, it's likely unbreakable
+            if issues_per_run:
+                common_issues = issues_per_run[0]
+                for issues in issues_per_run[1:]:
+                    common_issues = common_issues.intersection(issues)
+                
+                if len(common_issues) > 0 and any("cycle" in i.lower() or "dependency" in i.lower() for i in common_issues):
+                    return (
+                        True,
+                        UnbreakableReason.TIGHTLY_COUPLED_BY_DESIGN,
+                        f"After {len(validation_history)} attempts, the same core issues remain. "
+                        f"Common issues: {', '.join(list(common_issues)[:2])}. "
+                        "This suggests the cycle may be intentional or require a more fundamental redesign "
+                        "that is beyond the scope of automated refactoring."
+                    )
+        
+        # Check 6: External dependencies (if files reference things we can't modify)
+        external_patterns = [
+            r'from\s+(System|Microsoft|Google|Amazon)\.',
+            r'using\s+(System|Microsoft|Google|Amazon)\.',
+            r'import\s+(java\.lang|javax\.|org\.springframework)',
+        ]
+        external_refs = set()
+        for pattern in external_patterns:
+            matches = re.findall(pattern, all_content)
+            external_refs.update(matches)
+        
+        # If cycle nodes include terms that look like external packages
+        for node in nodes:
+            if any(ext in node for ext in ["System.", "Microsoft.", "javax.", "org."]):
+                return (
+                    True,
+                    UnbreakableReason.EXTERNAL_DEPENDENCY,
+                    f"Cycle includes external/framework code that cannot be modified: {node}. "
+                    "Only internal code can be refactored. Consider wrapping the external dependency."
+                )
+        
+        # No unbreakable pattern detected
+        return (False, UnbreakableReason.NOT_UNBREAKABLE, "")
+
+    def get_unbreakable_explanation(
+        self, reason: UnbreakableReason, cycle_spec: Dict[str, Any]
+    ) -> str:
+        """Generate a detailed explanation for why a cycle cannot be broken."""
+        nodes = cycle_spec.get("graph", {}).get("nodes", [])
+        node_list = ", ".join(nodes[:5])
+        
+        explanations = {
+            UnbreakableReason.MUTUAL_RECURSION: f"""
+## Cycle Cannot Be Broken: Mutual Recursion
+
+The cycle between **{node_list}** represents a fundamental algorithmic pattern 
+where components must reference each other to function correctly.
+
+### Why This Is Not Technical Debt
+- Mutual recursion is a valid design pattern for certain algorithms
+- Parser/Lexer, Visitor/Node, and Expression evaluators require bidirectional references
+- Attempting to break this would fundamentally change the algorithm's behavior
+
+### Recommended Actions
+1. **Document** this as an intentional architectural decision
+2. **Annotate** the code to suppress cycle detection warnings
+3. **Consider** if the cycle detection scope should exclude these patterns
+""",
+            UnbreakableReason.CIRCULAR_DATA_STRUCTURE: f"""
+## Cycle Cannot Be Broken: Circular Data Structure
+
+The cycle between **{node_list}** is part of a data model that inherently 
+requires bidirectional references (like parent-child in trees).
+
+### Why This Is Acceptable
+- Data structures often need navigation in both directions
+- This is at the data model level, not the module/package level
+- ORM frameworks and serializers handle these patterns correctly
+
+### Recommended Actions
+1. **Verify** the cycle is in the data model, not imports
+2. **Document** the data structure's intentional circularity
+3. **Consider** if the analysis should focus on package-level cycles only
+""",
+            UnbreakableReason.FRAMEWORK_REQUIREMENT: f"""
+## Cycle Cannot Be Broken: Framework Requirement
+
+The cycle between **{node_list}** appears to be required by the 
+framework or library being used.
+
+### Common Framework Patterns That Create Cycles
+- MVVM: View ↔ ViewModel data binding
+- Entity Framework: Navigation properties
+- Spring: Circular dependency injection
+- Event-driven: Publisher ↔ Subscriber
+
+### Recommended Actions
+1. **Verify** this is indeed a framework pattern
+2. **Check** framework documentation for best practices
+3. **Consider** if the framework provides alternatives (e.g., lazy injection)
+""",
+            UnbreakableReason.INCOMPLETE_CONTEXT: f"""
+## Cannot Analyze: Incomplete Context
+
+The file content provided for **{node_list}** is insufficient 
+to safely generate a refactoring.
+
+### What's Missing
+- File content may be truncated or empty
+- Key imports or class definitions are not visible
+- Cannot determine the full dependency structure
+
+### Recommended Actions
+1. **Provide** complete file content (not truncated)
+2. **Include** all files in the cycle, not just some
+3. **Retry** with the full source files
+""",
+            UnbreakableReason.EXTERNAL_DEPENDENCY: f"""
+## Cycle Cannot Be Broken: External Dependency
+
+The cycle includes **{node_list}**, which references external 
+or framework code that cannot be modified.
+
+### Why This Cannot Be Automated
+- External libraries are not under your control
+- Framework patterns may require specific relationships
+- Modifying external code would break updates/compatibility
+
+### Recommended Actions
+1. **Wrap** the external dependency with an internal abstraction
+2. **Create** an anti-corruption layer if needed
+3. **Accept** this as a boundary condition of the architecture
+""",
+            UnbreakableReason.TIGHTLY_COUPLED_BY_DESIGN: f"""
+## Cycle May Be Intentional: Tight Coupling By Design
+
+After multiple refactoring attempts, the cycle between **{node_list}** 
+persists. This suggests it may be an intentional design decision.
+
+### Possible Reasons
+- The components are intentionally cohesive
+- Breaking the cycle would require a fundamental redesign
+- The cost of breaking exceeds the maintenance benefit
+
+### Recommended Actions
+1. **Review** with the original authors if possible
+2. **Evaluate** if the cycle actually causes problems
+3. **Consider** accepting it with documentation
+4. **Plan** a larger refactoring effort if truly needed
+""",
+        }
+        
+        return explanations.get(reason, f"Cycle between {node_list} could not be broken.")
+
 
 
 # Convenience functions
