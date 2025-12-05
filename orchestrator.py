@@ -68,6 +68,17 @@ class Orchestrator:
         self.agents_order = getattr(self.config.pipeline, "agents_order", ["describer", "refactor", "validator"])
         self.enabled_agents = getattr(self.config.pipeline, "enable", {})
         
+        # Context settings (with fallbacks)
+        self.context_window = getattr(self.config, "context", {}).get("window_size", 4096) if hasattr(self.config, "context") else 4096
+        self.max_file_chars = getattr(self.config, "context", {}).get("max_file_chars", 4000) if hasattr(self.config, "context") else 4000
+        
+        # Also check LLM params for context size (may override)
+        if hasattr(self.config, "llm") and hasattr(self.config.llm, "params"):
+            llm_ctx = getattr(self.config.llm.params, "num_ctx", None)
+            if llm_ctx:
+                self.context_window = llm_ctx
+                logger.info(f"Context window from LLM config: {self.context_window} tokens")
+        
         # Unbreakable cycle detector
         self.query_builder = RAGQueryBuilder()
 
@@ -261,6 +272,8 @@ The cycle between **{node_list}** could not be automatically broken.
                 llm=self.llm,
                 prompt_template=self._get_prompt_template("describer"),
                 rag_service=self.rag_service,
+                context_window=self.context_window,
+                max_file_chars=self.max_file_chars,
             )
             desc_result = describer.run(cycle_spec, prompt=prompt)
             results["description"] = desc_result.output
@@ -315,6 +328,8 @@ The cycle between **{node_list}** could not be automatically broken.
                     llm=self.llm,
                     prompt_template=self._get_prompt_template("refactor"),
                     rag_service=self.rag_service,
+                    context_window=self.context_window,
+                    max_file_chars=self.max_file_chars,
                 )
                 # Convert description to CycleDescription model if needed
                 description = desc_result.output

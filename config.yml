@@ -5,6 +5,16 @@ llm:
     num_ctx: 4096
     temperature: 0.0
 
+# Context management settings
+context:
+  # Total context window size (tokens) - should match your LLM's limit
+  window_size: 4096
+  # Per-file character limits (used as fallback if budget system not active)
+  max_file_chars: 4000
+  max_diff_chars: 6000
+  # RAG context limits
+  max_rag_chars: 1500
+
 io:
   artifacts_dir: artifacts
   cyclic_folder: cyclicDepen

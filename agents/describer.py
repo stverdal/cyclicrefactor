@@ -5,6 +5,11 @@ from utils.snippet_selector import select_relevant_snippet
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, QueryIntent, CycleAnalysis
+from utils.context_budget import (
+    ContextBudget, BudgetCategory, TokenEstimator,
+    prioritize_cycle_files, get_file_budget, create_budget_for_agent,
+    truncate_to_token_budget
+)
 from models.schemas import CycleSpec, CycleDescription
 import json
 
@@ -21,20 +26,22 @@ class DescriberAgent(Agent):
     """
     
     name = "describer"
-    version = "0.6"
+    version = "0.7"
 
     def __init__(
         self,
         llm=None,
         prompt_template: str = None,
         max_file_chars: int = 4000,
-        rag_service=None
+        rag_service=None,
+        context_window: int = 4096,
     ):
         self.llm = llm
         self.prompt_template = prompt_template
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
+        self.context_window = context_window
 
     def _analyze_cycle(self, cycle: CycleSpec) -> CycleAnalysis:
         """Analyze the cycle to classify its type and characteristics."""
@@ -119,21 +126,55 @@ class DescriberAgent(Agent):
         return "\n".join(parts)
 
     def _build_prompt(self, cycle: CycleSpec, analysis: CycleAnalysis) -> str:
-        """Build prompt with cycle analysis and strategy guidance."""
+        """Build prompt with cycle analysis and strategy guidance.
+        
+        Uses context budget management to optimize for limited context window.
+        """
         file_paths = cycle.get_file_paths()
-
-        # Prepare file content snippets
-        snippets = []
         cycle_dict = cycle.model_dump()
+        
+        # Create context budget for this agent
+        budget = create_budget_for_agent("describer", total_tokens=self.context_window)
+        
+        # Prioritize files based on cycle structure
+        files_data = [{"path": f.path, "content": f.content or ""} for f in cycle.files]
+        file_priorities = prioritize_cycle_files(
+            files_data,
+            cycle_dict.get("graph", {}),
+            total_char_budget=budget.get_char_budget(BudgetCategory.FILE_CONTENT),
+        )
+        
+        # Build file snippets with priority-based budgets
+        snippets = []
+        total_file_tokens = 0
+        file_token_budget = budget.get_token_budget(BudgetCategory.FILE_CONTENT)
+        
         for f in cycle.files:
+            if total_file_tokens >= file_token_budget:
+                break
+                
             content = f.content or ""
-            snippet = select_relevant_snippet(content, f.path, cycle_dict, self.max_file_chars)
-            snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+            file_budget = get_file_budget(f.path, file_priorities, self.max_file_chars)
+            snippet = select_relevant_snippet(content, f.path, cycle_dict, file_budget)
+            snippet_tokens = TokenEstimator.estimate_tokens_for_file(snippet, f.path)
+            
+            if total_file_tokens + snippet_tokens <= file_token_budget:
+                snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+                total_file_tokens += snippet_tokens
+            else:
+                remaining_tokens = file_token_budget - total_file_tokens
+                truncated = truncate_to_token_budget(snippet, remaining_tokens)
+                snippets.append(f"--- FILE: {f.path} ---\n{truncated}")
+                break
 
         file_snippets = "\n\n".join(snippets) if snippets else ""
+        logger.debug(f"File content: {total_file_tokens} tokens used across {len(snippets)} files")
         
-        # Get RAG context using conceptual queries
+        # Get RAG context with budget limit
+        rag_token_budget = budget.get_token_budget(BudgetCategory.RAG_CONTEXT)
         rag_context = self._get_rag_context(cycle, analysis)
+        if rag_context:
+            rag_context = truncate_to_token_budget(rag_context, rag_token_budget, "prose")
         
         # Build analysis context
         analysis_context = self._build_analysis_context(analysis)

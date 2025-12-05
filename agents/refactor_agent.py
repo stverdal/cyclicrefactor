@@ -5,6 +5,11 @@ from utils.snippet_selector import select_relevant_snippet
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, QueryIntent, CycleAnalysis
+from utils.context_budget import (
+    ContextBudget, BudgetCategory, TokenEstimator,
+    prioritize_cycle_files, get_file_budget, create_budget_for_agent,
+    truncate_to_token_budget
+)
 from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport
 import json
 import difflib
@@ -82,13 +87,15 @@ After:
         llm=None,
         prompt_template: str = None,
         max_file_chars: int = 4000,
-        rag_service=None
+        rag_service=None,
+        context_window: int = 4096,
     ):
         self.llm = llm
         self.prompt_template = prompt_template
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
+        self.context_window = context_window
 
     def _extract_strategy_from_description(self, description: CycleDescription) -> Optional[str]:
         """Extract the recommended strategy from the Describer's output."""
@@ -208,23 +215,75 @@ After:
         feedback: Optional[ValidationReport] = None,
         strategy: Optional[str] = None,
     ) -> str:
-        """Build prompt with strategy guidance, examples, and chain-of-thought."""
+        """Build prompt with strategy guidance, examples, and chain-of-thought.
+        
+        Uses context budget management to optimize for limited context window.
+        """
         file_paths = cycle.get_file_paths()
-
-        # Prepare file content snippets
-        snippets = []
         cycle_dict = cycle.model_dump()
+        has_feedback = feedback is not None
+        
+        # Create context budget for this agent
+        budget = create_budget_for_agent(
+            "refactor", 
+            total_tokens=self.context_window,
+            has_feedback=has_feedback
+        )
+        
+        # Get validation issues for file prioritization (if retry)
+        validation_issues = None
+        if feedback and feedback.issues:
+            validation_issues = [{"path": i.path, "comment": i.comment} for i in feedback.issues]
+        
+        # Prioritize files based on cycle structure and validation issues
+        files_data = [{"path": f.path, "content": f.content or ""} for f in cycle.files]
+        file_priorities = prioritize_cycle_files(
+            files_data,
+            cycle_dict.get("graph", {}),
+            validation_issues=validation_issues,
+            total_char_budget=budget.get_char_budget(BudgetCategory.FILE_CONTENT),
+        )
+        
+        # Build file snippets with priority-based budgets
+        snippets = []
+        total_file_tokens = 0
+        file_token_budget = budget.get_token_budget(BudgetCategory.FILE_CONTENT)
+        
         for f in cycle.files:
+            if total_file_tokens >= file_token_budget:
+                logger.debug(f"File budget exhausted, skipping remaining files")
+                break
+                
             content = f.content or ""
-            snippet = select_relevant_snippet(content, f.path, cycle_dict, self.max_file_chars)
-            snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+            file_budget = get_file_budget(f.path, file_priorities, self.max_file_chars)
+            
+            # Select snippet with file-specific budget
+            snippet = select_relevant_snippet(content, f.path, cycle_dict, file_budget)
+            snippet_tokens = TokenEstimator.estimate_tokens_for_file(snippet, f.path)
+            
+            # Check if we have room
+            if total_file_tokens + snippet_tokens <= file_token_budget:
+                snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+                total_file_tokens += snippet_tokens
+            else:
+                # Truncate to fit remaining budget
+                remaining_tokens = file_token_budget - total_file_tokens
+                truncated = truncate_to_token_budget(snippet, remaining_tokens)
+                snippets.append(f"--- FILE: {f.path} ---\n{truncated}")
+                total_file_tokens = file_token_budget
+                break
 
         file_snippets = "\n\n".join(snippets) if snippets else ""
+        budget.use_budget(BudgetCategory.FILE_CONTENT, total_file_tokens)
+        logger.debug(f"File content: {total_file_tokens} tokens used across {len(snippets)} files")
         
-        # Get RAG context with strategy focus
+        # Get RAG context with budget limit
+        rag_token_budget = budget.get_token_budget(BudgetCategory.RAG_CONTEXT)
         rag_context = self._get_rag_context(cycle, strategy, description)
+        if rag_context:
+            rag_context = truncate_to_token_budget(rag_context, rag_token_budget, "prose")
         
-        # Get pattern example
+        # Get pattern example (fits in examples budget)
         pattern_example = self._get_pattern_example(strategy)
 
         if self.prompt_template:
@@ -335,47 +394,217 @@ OR use file markers:
         return result
 
     def _parse_json_patches(self, text: str) -> List[Dict[str, str]]:
-        """Parse patches from JSON format in LLM response."""
+        """Parse patches from JSON format in LLM response.
+        
+        Handles various LLM output formats:
+        1. Clean JSON
+        2. JSON wrapped in markdown code blocks
+        3. JSON with embedded code blocks for file content
+        """
+        # Step 1: Strip markdown code block wrapper if present
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]  # Remove ```json
+        elif text.startswith("```"):
+            text = text[3:]  # Remove ```
+        if text.endswith("```"):
+            text = text[:-3]  # Remove trailing ```
+        text = text.strip()
+        
+        # Step 2: Try direct JSON parsing first
         try:
-            # Try to find JSON object in the response
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if not json_match:
-                logger.debug("No JSON object found in response")
-                return []
+            data = json.loads(text)
+            return self._extract_patches_from_data(data)
+        except json.JSONDecodeError:
+            pass
+        
+        # Step 3: Try to find JSON object with regex
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            try:
+                data = json.loads(json_match.group())
+                return self._extract_patches_from_data(data)
+            except json.JSONDecodeError as e:
+                logger.debug(f"JSON parse failed: {e}")
+        
+        # Step 4: Try to extract patches with embedded code blocks
+        # LLM sometimes outputs: "patched": "```csharp\n...code...\n```"
+        # or even uses actual newlines in the JSON string
+        patches = self._parse_json_with_code_blocks(text)
+        if patches:
+            return patches
+        
+        # Step 5: Try a more lenient extraction - find patches array directly
+        patches = self._extract_patches_lenient(text)
+        if patches:
+            return patches
+        
+        logger.debug("All JSON parsing strategies failed")
+        return []
+    
+    def _extract_patches_from_data(self, data: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Extract patches from parsed JSON data."""
+        patches = []
+        raw_patches = data.get("patches", [])
+        
+        if not raw_patches:
+            logger.debug("JSON parsed but no 'patches' array found")
+            return []
+        
+        for p in raw_patches:
+            path = p.get("path")
+            patched = p.get("patched")
             
-            json_str = json_match.group()
-            data = json.loads(json_str)
+            if not path:
+                logger.warning("Patch missing 'path' field")
+                continue
+            if not patched:
+                logger.warning(f"Patch for {path} missing 'patched' content")
+                continue
             
-            patches = []
-            raw_patches = data.get("patches", [])
-            
-            if not raw_patches:
-                logger.debug("JSON parsed but no 'patches' array found")
-                return []
-            
-            for p in raw_patches:
-                path = p.get("path")
-                patched = p.get("patched")
+            # Clean up the patched content (remove code block markers if present)
+            patched = self._clean_code_content(patched)
                 
-                if not path:
-                    logger.warning("Patch missing 'path' field")
-                    continue
-                if not patched:
-                    logger.warning(f"Patch for {path} missing 'patched' content")
-                    continue
-                    
+            patches.append({
+                "path": path,
+                "patched": patched
+            })
+        
+        return patches
+    
+    def _clean_code_content(self, content: str) -> str:
+        """Remove code block markers from content."""
+        content = content.strip()
+        # Remove leading code block marker with optional language
+        if content.startswith("```"):
+            first_newline = content.find("\n")
+            if first_newline != -1:
+                content = content[first_newline + 1:]
+            else:
+                content = content[3:]
+        # Remove trailing code block marker
+        if content.endswith("```"):
+            content = content[:-3]
+        return content.strip()
+    
+    def _parse_json_with_code_blocks(self, text: str) -> List[Dict[str, str]]:
+        """Parse JSON where patched content might have embedded code blocks.
+        
+        Some LLMs output:
+        {
+          "patches": [
+            {
+              "path": "file.cs",
+              "patched": "```csharp
+              ...actual code...
+              ```"
+            }
+          ]
+        }
+        """
+        patches = []
+        
+        # Find all path/patched pairs using a more flexible pattern
+        # Look for "path": "..." followed eventually by "patched": "..."
+        path_pattern = r'"path"\s*:\s*"([^"]+)"'
+        
+        # Find all paths first
+        path_matches = list(re.finditer(path_pattern, text))
+        
+        for i, path_match in enumerate(path_matches):
+            path = path_match.group(1)
+            
+            # Find the "patched" field after this path
+            start_search = path_match.end()
+            end_search = path_matches[i + 1].start() if i + 1 < len(path_matches) else len(text)
+            
+            section = text[start_search:end_search]
+            
+            # Look for patched content - might be a code block
+            patched_match = re.search(r'"patched"\s*:\s*"', section)
+            if patched_match:
+                # Find where the value starts
+                value_start = patched_match.end()
+                # Now find the end - this is tricky because the content might have quotes
+                # Look for the pattern that ends the JSON string
+                # Could end with ", or "} or "] 
+                content_section = section[value_start:]
+                
+                # Try to find the end by looking for unescaped quote followed by comma/bracket
+                patched_content = self._extract_json_string_value(content_section)
+                if patched_content:
+                    patched_content = self._clean_code_content(patched_content)
+                    patches.append({"path": path, "patched": patched_content})
+        
+        return patches
+    
+    def _extract_json_string_value(self, text: str) -> Optional[str]:
+        """Extract a JSON string value, handling escaped characters."""
+        result = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == '\\' and i + 1 < len(text):
+                # Escaped character
+                next_char = text[i + 1]
+                if next_char == 'n':
+                    result.append('\n')
+                elif next_char == 't':
+                    result.append('\t')
+                elif next_char == 'r':
+                    result.append('\r')
+                elif next_char == '"':
+                    result.append('"')
+                elif next_char == '\\':
+                    result.append('\\')
+                else:
+                    result.append(next_char)
+                i += 2
+            elif char == '"':
+                # End of string
+                return ''.join(result)
+            else:
+                result.append(char)
+                i += 1
+        
+        # Didn't find closing quote - return what we have
+        return ''.join(result) if result else None
+    
+    def _extract_patches_lenient(self, text: str) -> List[Dict[str, str]]:
+        """Lenient extraction when JSON parsing fails.
+        
+        Looks for file paths and code content directly.
+        """
+        patches = []
+        
+        # Pattern: "path": "/some/path/file.cs" followed by code
+        # Then look for code blocks or "patched": content
+        
+        # Find patterns like: "path": "...", "patched": <content>
+        # where content might be malformed JSON but contains the code
+        
+        path_matches = re.findall(r'"path"\s*:\s*"([^"]+)"', text)
+        
+        for path in path_matches:
+            # Try to find associated code block after the path mention
+            path_pos = text.find(f'"path": "{path}"') 
+            if path_pos == -1:
+                path_pos = text.find(f'"path":"{path}"')
+            if path_pos == -1:
+                continue
+            
+            # Look for code block after this path
+            remaining = text[path_pos:]
+            
+            # Look for code block markers
+            code_block_match = re.search(r'```(?:csharp|cs|python|java|javascript|typescript)?\n([\s\S]*?)```', remaining)
+            if code_block_match:
                 patches.append({
                     "path": path,
-                    "patched": patched
+                    "patched": code_block_match.group(1).strip()
                 })
-            
-            return patches
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSON parse failed: {e}")
-            return []
-        except Exception as e:
-            logger.debug(f"JSON extraction failed: {e}")
-            return []
+        
+        return patches
 
     def _parse_marker_patches(self, text: str) -> List[Dict[str, str]]:
         # Split by marker lines like '--- FILE: path ---'
