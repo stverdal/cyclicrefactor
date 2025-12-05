@@ -293,6 +293,7 @@ class Orchestrator:
             explainer = ExplainerAgent(
                 llm=self.llm,
                 prompt_template=self._get_prompt_template("explainer"),
+                rag_service=self.rag_service,
             )
             # Convert validation to ValidationReport model if needed
             validation = val_result.output

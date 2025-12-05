@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Set, Tuple
 import json
 import re
 from .agent_base import Agent, AgentResult
@@ -59,18 +59,35 @@ class ValidatorAgent(Agent):
         description: CycleDescription,
         proposal: RefactorProposal,
     ) -> str:
-        """Construct a prompt for the LLM to review the refactor proposal."""
+        """Construct a prompt for the LLM to review the refactor proposal.
+        
+        Optimized for limited context: sends diffs instead of full patched files.
+        """
         file_paths = cycle.get_file_paths()
 
-        # Build patched file snippets
-        patch_snippets = []
+        # Build DIFF snippets instead of full patched files (more context-efficient)
+        diff_snippets = []
+        total_chars = 0
+        max_diff_chars = self.max_file_chars * 2  # Allow more room for diffs
+        
         for p in proposal.patches:
-            content = p.patched or ""
-            if len(content) > self.max_file_chars:
-                content = content[: self.max_file_chars] + "\n...[truncated]"
-            patch_snippets.append(f"--- PATCHED FILE: {p.path} ---\n{content}")
+            diff = p.diff or ""
+            if not diff:
+                continue
+            
+            if total_chars + len(diff) > max_diff_chars:
+                remaining = len([x for x in proposal.patches if x.diff])
+                diff_snippets.append(f"... [{remaining} more file diffs truncated for context limit]")
+                break
+            
+            diff_snippets.append(f"### {p.path}\n```diff\n{diff}\n```")
+            total_chars += len(diff)
 
-        patched_files_text = "\n\n".join(patch_snippets) if patch_snippets else "(no patches)"
+        diffs_text = "\n\n".join(diff_snippets) if diff_snippets else "(no changes detected)"
+        
+        # Count what changed for context
+        files_changed = len([p for p in proposal.patches if p.diff])
+        files_unchanged = len(proposal.patches) - files_changed
 
         # If we have a template file/path, load it
         if self.prompt_template:
@@ -81,41 +98,34 @@ class ValidatorAgent(Agent):
                 graph=json.dumps(cycle.graph.model_dump()),
                 files=", ".join(file_paths),
                 description=description.text,
-                patched_files=patched_files_text,
+                patched_files=diffs_text,  # Now contains diffs, not full files
+                diffs=diffs_text,
+                files_changed=files_changed,
+                files_unchanged=files_unchanged,
             )
 
-        # Default prompt when no template provided
-        base = f"""You are a code-review assistant validating a refactor proposal intended to break a cyclic dependency.
+        # Default prompt - optimized for limited context
+        return f"""You are validating a refactor proposal to break a cyclic dependency.
 
-## Cycle Information
+## Cycle
 - ID: {cycle.id}
-- Graph: {json.dumps(cycle.graph.model_dump())}
-- Affected files: {', '.join(file_paths)}
+- Nodes: {', '.join(cycle.graph.nodes)}
+- Edges: {cycle.graph.edges}
 
-## Description from describer agent
-{description.text}
+## Problem Description
+{description.text[:1500] if len(description.text) > 1500 else description.text}
 
-## Proposed Patches
-{patched_files_text}
+## Changes ({files_changed} files modified, {files_unchanged} unchanged)
+{diffs_text}
 
-## Your Task
-1. Determine whether the patches effectively break or reduce the cycle described above.
-2. Check for obvious errors, missing imports, or regressions.
-3. Decide: APPROVED if the refactor is acceptable, or NEEDS_REVISION otherwise.
+## Validate
+1. Do the changes break/reduce the cycle? (Check if dependencies are inverted or removed)
+2. Any syntax errors, missing imports, or broken references?
+3. Is the refactor complete or are there remaining cyclic paths?
 
-## Output Format (strict JSON)
-{{
-  "decision": "APPROVED" | "NEEDS_REVISION",
-  "summary": "<one-sentence verdict>",
-  "issues": [
-    {{"path": "...", "line": <n or null>, "comment": "<what's wrong or could be improved>"}}
-  ],
-  "suggestions": ["<concrete next-step if revision needed>"]
-}}
-
-Only output the JSON object, nothing else.
+## Output (JSON only)
+{{"decision": "APPROVED"|"NEEDS_REVISION", "summary": "...", "issues": [{{"path": "...", "line": null, "comment": "..."}}], "suggestions": ["..."]}}
 """
-        return base
 
     # -------------------------------------------------------------------------
     # Response parsing
@@ -143,15 +153,154 @@ Only output the JSON object, nothing else.
     # Rule-based checks (used when no LLM or as additional layer)
     # -------------------------------------------------------------------------
 
+    def _extract_imports_csharp(self, content: str) -> Set[str]:
+        """Extract 'using' statements from C# code."""
+        imports = set()
+        for match in re.finditer(r'^\s*using\s+([\w.]+)\s*;', content, re.MULTILINE):
+            imports.add(match.group(1))
+        return imports
+    
+    def _extract_imports_python(self, content: str) -> Set[str]:
+        """Extract import statements from Python code."""
+        imports = set()
+        # import X, from X import Y
+        for match in re.finditer(r'^\s*(?:from\s+([\w.]+)\s+)?import\s+([\w., ]+)', content, re.MULTILINE):
+            if match.group(1):
+                imports.add(match.group(1))
+            for mod in match.group(2).split(','):
+                imports.add(mod.strip().split()[0])  # Handle 'import X as Y'
+        return imports
+    
+    def _extract_type_references(self, content: str, nodes: List[str]) -> Set[str]:
+        """Find references to cycle nodes in code content."""
+        refs = set()
+        for node in nodes:
+            # Look for the node name as a type reference (class, interface, etc.)
+            # Match: ClassName, IClassName, _className, etc.
+            pattern = rf'\b{re.escape(node)}\b'
+            if re.search(pattern, content):
+                refs.add(node)
+        return refs
+    
+    def _check_syntax_errors(self, path: str, content: str) -> List[ValidationIssue]:
+        """Check for obvious syntax errors without external tools."""
+        issues = []
+        
+        # Determine language from extension
+        ext = path.split('.')[-1].lower() if '.' in path else ''
+        
+        if ext == 'py':
+            # Python: check for unbalanced brackets/parens
+            issues.extend(self._check_bracket_balance(path, content, 
+                [('(', ')'), ('[', ']'), ('{', '}')]))
+            # Check for common Python syntax issues
+            if re.search(r'^\s*def\s+\w+[^:]*$', content, re.MULTILINE):
+                issues.append(ValidationIssue(
+                    path=path, line=None, 
+                    comment="Possible missing colon after function definition"
+                ))
+        
+        elif ext == 'cs':
+            # C#: check for unbalanced braces
+            issues.extend(self._check_bracket_balance(path, content, 
+                [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')]))
+            # Check for missing semicolons (heuristic)
+            lines = content.split('\n')
+            for i, line in enumerate(lines, 1):
+                stripped = line.strip()
+                # Lines that should end with ; but don't
+                if (stripped and 
+                    not stripped.endswith((';', '{', '}', ')', ',', '//')) and
+                    not stripped.startswith(('if', 'else', 'for', 'while', 'using', 'namespace', 'class', 'interface', 'public', 'private', 'protected', '//', '/*', '*', '#')) and
+                    not stripped.endswith('=>') and
+                    '=' in stripped and
+                    not stripped.endswith('{')):
+                    # This is a heuristic, may have false positives
+                    pass  # Too noisy, skip for now
+        
+        return issues
+    
+    def _check_bracket_balance(self, path: str, content: str, 
+                                pairs: List[Tuple[str, str]]) -> List[ValidationIssue]:
+        """Check if brackets/braces are balanced."""
+        issues = []
+        for open_char, close_char in pairs:
+            # Simple count (doesn't handle strings/comments, but catches obvious errors)
+            open_count = content.count(open_char)
+            close_count = content.count(close_char)
+            if open_count != close_count:
+                issues.append(ValidationIssue(
+                    path=path, line=None,
+                    comment=f"Unbalanced '{open_char}{close_char}': {open_count} open, {close_count} close"
+                ))
+        return issues
+    
+    def _analyze_cycle_impact(self, cycle: CycleSpec, proposal: RefactorProposal) -> Tuple[List[str], List[ValidationIssue]]:
+        """Analyze whether the patches likely break the cycle.
+        
+        Returns:
+            Tuple of (observations, issues)
+        """
+        observations = []
+        issues = []
+        nodes = set(cycle.graph.nodes)
+        
+        for patch in proposal.patches:
+            if not patch.diff:
+                continue
+            
+            original = patch.original or ""
+            patched = patch.patched or ""
+            
+            # Check which nodes were referenced before and after
+            refs_before = self._extract_type_references(original, cycle.graph.nodes)
+            refs_after = self._extract_type_references(patched, cycle.graph.nodes)
+            
+            removed_refs = refs_before - refs_after
+            added_refs = refs_after - refs_before
+            
+            if removed_refs:
+                observations.append(f"{patch.path}: Removed references to {', '.join(removed_refs)}")
+                logger.info(f"Cycle impact: {patch.path} removed refs to {removed_refs}")
+            
+            if added_refs:
+                observations.append(f"{patch.path}: Added references to {', '.join(added_refs)}")
+                # Adding new references might indicate the cycle isn't broken
+                logger.warning(f"Cycle impact: {patch.path} added refs to {added_refs}")
+            
+            # Check for interface extraction pattern (common cycle-breaking technique)
+            if re.search(r'\binterface\s+I\w+', patched) and not re.search(r'\binterface\s+I\w+', original):
+                observations.append(f"{patch.path}: New interface defined (dependency inversion pattern)")
+                logger.info(f"Detected interface extraction in {patch.path}")
+        
+        # If no references were removed, the cycle might not be broken
+        if not any("Removed references" in obs for obs in observations):
+            if any(patch.diff for patch in proposal.patches):
+                issues.append(ValidationIssue(
+                    path="(cycle analysis)",
+                    line=None,
+                    comment="Changes detected but no direct references between cycle nodes were removed. Verify cycle is actually broken."
+                ))
+        
+        return observations, issues
+
     def _rule_based_checks(
         self, cycle: CycleSpec, proposal: RefactorProposal
-    ) -> List[ValidationIssue]:
-        """Perform lightweight deterministic checks on the proposal."""
+    ) -> Tuple[List[ValidationIssue], List[str]]:
+        """Perform lightweight deterministic checks on the proposal.
+        
+        Returns:
+            Tuple of (issues, observations)
+        """
         issues: List[ValidationIssue] = []
+        observations: List[str] = []
         known_paths = {f.path for f in cycle.files}
+
+        logger.info("Running rule-based validation checks...")
 
         for p in proposal.patches:
             path = p.path
+            
             # Check patch targets known file
             if path not in known_paths and path.split("/")[-1] not in {
                 pth.split("/")[-1] for pth in known_paths
@@ -159,18 +308,40 @@ Only output the JSON object, nothing else.
                 issues.append(
                     ValidationIssue(path=path, line=None, comment="Patch targets unknown file")
                 )
+                logger.warning(f"Patch targets unknown file: {path}")
+            
             # Check non-empty patched content
             if not p.patched:
                 issues.append(
                     ValidationIssue(path=path, line=None, comment="Patched content is empty")
                 )
+                logger.warning(f"Patch is empty: {path}")
+            
             # Check diff exists (i.e., something changed)
             if p.original == p.patched:
                 issues.append(
                     ValidationIssue(path=path, line=None, comment="No changes detected in patch")
                 )
+                logger.debug(f"No changes in patch: {path}")
+            else:
+                # Run syntax checks on changed files
+                syntax_issues = self._check_syntax_errors(path, p.patched or "")
+                if syntax_issues:
+                    logger.warning(f"Syntax issues in {path}: {len(syntax_issues)}")
+                issues.extend(syntax_issues)
 
-        return issues
+        # Analyze cycle impact
+        cycle_observations, cycle_issues = self._analyze_cycle_impact(cycle, proposal)
+        observations.extend(cycle_observations)
+        issues.extend(cycle_issues)
+        
+        # Log summary
+        files_changed = len([p for p in proposal.patches if p.diff])
+        logger.info(f"Rule-based checks complete: {len(issues)} issues, {files_changed} files changed")
+        for obs in observations:
+            logger.info(f"  Observation: {obs}")
+
+        return issues, observations
 
     # -------------------------------------------------------------------------
     # Main run
@@ -212,17 +383,21 @@ Only output the JSON object, nothing else.
         logger.debug(f"Validating proposal with {len(proposal.patches)} patches")
 
         # Rule-based checks first
-        rule_issues = self._rule_based_checks(cycle_spec, proposal)
-        logger.debug(f"Rule-based checks found {len(rule_issues)} issues")
+        rule_issues, observations = self._rule_based_checks(cycle_spec, proposal)
+        logger.debug(f"Rule-based checks found {len(rule_issues)} issues, {len(observations)} observations")
 
         # If no LLM, return rule-based result
         if self.llm is None:
             approved = len(rule_issues) == 0
             logger.info(f"No LLM provided, rule-based validation: approved={approved}")
+            # Include observations in summary for visibility
+            summary = "Rule-based validation only (no LLM provided)."
+            if observations:
+                summary += " Observations: " + "; ".join(observations[:3])
             report = ValidationReport(
                 approved=approved,
                 decision="APPROVED" if approved else "NEEDS_REVISION",
-                summary="Rule-based validation only (no LLM provided).",
+                summary=summary,
                 issues=rule_issues,
                 suggestions=["Provide an LLM for semantic review."] if rule_issues else [],
             )
@@ -230,6 +405,13 @@ Only output the JSON object, nothing else.
 
         # LLM-based review
         prompt = self._build_prompt(cycle_spec, description, proposal)
+        
+        # Append observations to prompt if any
+        if observations:
+            prompt += "\n\nPreliminary observations from static analysis:\n"
+            for obs in observations:
+                prompt += f"- {obs}\n"
+        
         logger.debug(f"Built validation prompt with {len(prompt)} chars")
 
         try:
