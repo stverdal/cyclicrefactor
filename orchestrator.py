@@ -596,6 +596,33 @@ The cycle between **{node_list}** could not be automatically broken.
         
         pipeline_elapsed = time.time() - pipeline_start
 
+        # Persist failed patches for analysis (at DEBUG level in logs, always in artifacts)
+        if accumulated_reverted_files:
+            try:
+                # Build detailed failure records for analysis
+                failed_patches = []
+                for rf in accumulated_reverted_files:
+                    if isinstance(rf, dict):
+                        failed_patches.append({
+                            "path": rf.get("path", "unknown"),
+                            "reason": rf.get("reason", "unknown"),
+                            "warnings": rf.get("warnings", []),
+                            "original_patched_preview": rf.get("original_patched", "")[:1000] if rf.get("original_patched") else None,
+                        })
+                    elif hasattr(rf, "path"):
+                        failed_patches.append({
+                            "path": getattr(rf, "path", "unknown"),
+                            "reason": getattr(rf, "reason", "unknown"),
+                            "warnings": getattr(rf, "warnings", []),
+                            "original_patched_preview": getattr(rf, "original_patched", "")[:1000] if getattr(rf, "original_patched", None) else None,
+                        })
+                
+                if failed_patches:
+                    self.persistor.persist_failed_patches(artifact_id, failed_patches)
+                    logger.debug(f"Persisted {len(failed_patches)} failed patch records for analysis")
+            except Exception as e:
+                logger.warning(f"Failed to persist failed patches: {e}")
+
         # Save run metadata
         try:
             self.persistor.save_json(artifact_id, "run_metadata.json", {
@@ -604,6 +631,7 @@ The cycle between **{node_list}** could not be automatically broken.
                 "duration_seconds": round(pipeline_elapsed, 1),
                 "iterations": iteration,
                 "approved": approved,
+                "failed_patches_count": len(accumulated_reverted_files),
                 "agents_run": [a for a in ["describer", "refactor", "validator", "explainer"] if self._is_agent_enabled(a)],
             })
         except Exception as e:

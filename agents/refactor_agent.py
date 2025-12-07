@@ -819,6 +819,97 @@ public class Foo : INewInterface
     def _check_for_truncation(self, content: str, path: str) -> bool:
         """Check if content appears to be truncated. Delegates to utils.diff_utils."""
         return check_for_truncation(content, path)
+    
+    def _log_failed_patch_details(
+        self,
+        path: str,
+        original: str,
+        patched_entry: Optional[Dict[str, Any]],
+        warnings: List[str],
+        reason: str,
+    ) -> None:
+        """Log detailed information about a failed patch for debugging.
+        
+        This logs at DEBUG level to help diagnose why patches fail to apply.
+        Information is logged in a structured way for later analysis.
+        """
+        logger.debug("=" * 60)
+        logger.debug(f"FAILED PATCH DETAILS: {path}")
+        logger.debug("=" * 60)
+        logger.debug(f"Failure reason: {reason}")
+        
+        # Log original file info
+        original_lines = original.split('\n') if original else []
+        logger.debug(f"Original file: {len(original_lines)} lines, {len(original)} chars")
+        
+        # Log first/last lines of original for context
+        if original_lines:
+            logger.debug(f"Original first 3 lines:")
+            for i, line in enumerate(original_lines[:3]):
+                logger.debug(f"  {i+1}: {line[:100]}")
+            if len(original_lines) > 6:
+                logger.debug(f"  ... ({len(original_lines) - 6} lines omitted) ...")
+            logger.debug(f"Original last 3 lines:")
+            for i, line in enumerate(original_lines[-3:]):
+                logger.debug(f"  {len(original_lines) - 2 + i}: {line[:100]}")
+        
+        # Log what the LLM tried to do
+        if patched_entry:
+            logger.debug("-" * 40)
+            logger.debug("LLM patch entry:")
+            
+            if patched_entry.get("patched"):
+                patched_content = patched_entry.get("patched", "")
+                patched_lines = patched_content.split('\n')
+                logger.debug(f"  Type: full patched content ({len(patched_lines)} lines)")
+                logger.debug(f"  First 3 lines:")
+                for line in patched_lines[:3]:
+                    logger.debug(f"    {line[:100]}")
+            
+            elif patched_entry.get("search_replace"):
+                sr_list = patched_entry.get("search_replace", [])
+                logger.debug(f"  Type: JSON search_replace ({len(sr_list)} operations)")
+                for i, sr in enumerate(sr_list[:5]):  # Log up to 5 operations
+                    search_text = sr.get("search", "")
+                    replace_text = sr.get("replace", "")
+                    search_lines = search_text.split('\n')
+                    replace_lines = replace_text.split('\n')
+                    logger.debug(f"  Operation {i+1}:")
+                    logger.debug(f"    Search ({len(search_lines)} lines):")
+                    for line in search_lines[:3]:
+                        logger.debug(f"      | {line[:80]}")
+                    if len(search_lines) > 3:
+                        logger.debug(f"      ... ({len(search_lines) - 3} more lines)")
+                    logger.debug(f"    Replace ({len(replace_lines)} lines):")
+                    for line in replace_lines[:3]:
+                        logger.debug(f"      | {line[:80]}")
+                    if len(replace_lines) > 3:
+                        logger.debug(f"      ... ({len(replace_lines) - 3} more lines)")
+                if len(sr_list) > 5:
+                    logger.debug(f"  ... and {len(sr_list) - 5} more operations")
+            
+            elif patched_entry.get("search_replace_blocks"):
+                blocks = patched_entry.get("search_replace_blocks", "")
+                logger.debug(f"  Type: marker-style SEARCH/REPLACE ({len(blocks)} chars)")
+                # Log first 500 chars of blocks
+                logger.debug(f"  Content preview:")
+                for line in blocks[:500].split('\n'):
+                    logger.debug(f"    {line[:100]}")
+                if len(blocks) > 500:
+                    logger.debug(f"    ... ({len(blocks) - 500} more chars)")
+        else:
+            logger.debug("No patch entry found for this file")
+        
+        # Log warnings
+        if warnings:
+            logger.debug("-" * 40)
+            logger.debug(f"Warnings ({len(warnings)}):")
+            for w in warnings[:10]:
+                logger.debug(f"  - {w}")
+            if len(warnings) > 10:
+                logger.debug(f"  ... and {len(warnings) - 10} more warnings")
+        
+        logger.debug("=" * 60)
 
     def _process_single_file_patch(
         self,
@@ -906,6 +997,10 @@ public class Foo : INewInterface
                     patch_status = "failed"
                     revert_reason = "No SEARCH/REPLACE blocks could be applied"
                     has_critical_error = True
+                    # Log detailed failure info at DEBUG level
+                    self._log_failed_patch_details(
+                        path, original, patched_entry, sr_result.warnings, revert_reason
+                    )
                 elif not sr_result.is_atomic:
                     patch_status = "partial"
                 else:
@@ -927,6 +1022,10 @@ public class Foo : INewInterface
                     patch_status = "failed"
                     revert_reason = "No search/replace operations could be applied"
                     has_critical_error = True
+                    # Log detailed failure info at DEBUG level
+                    self._log_failed_patch_details(
+                        path, original, patched_entry, sr_result.warnings, revert_reason
+                    )
                 else:
                     patch_status = "applied"
                 
@@ -956,6 +1055,10 @@ public class Foo : INewInterface
                 has_critical_error = True
                 revert_reason = "; ".join(i.message for i in validation_result.issues if i.severity == "critical")
                 original_patched = patched  # Save what we tried
+                # Log detailed failure info at DEBUG level
+                self._log_failed_patch_details(
+                    path, original, patched_entry, patch_warnings + validation_issues, revert_reason
+                )
         
         # Compile/lint check (if enabled and no critical errors yet)
         compile_info = CompileCheckInfo()

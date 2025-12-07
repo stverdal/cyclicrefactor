@@ -185,6 +185,74 @@ def try_find_search_text(
                 logger.debug(f"Anchor match: lines {start_idx}-{end_idx}, similarity={base_score:.2f}, confidence={confidence:.2f}")
                 return MatchResult(start_idx, end_idx, "anchor", min(0.8, confidence))
     
+    # Strategy 3: Fuzzy line-by-line matching (for LLM-hallucinated whitespace/minor differences)
+    # This is useful when the LLM generates code that's "close" but not exact
+    best_fuzzy_match = None
+    best_fuzzy_score = 0.0
+    
+    for i in range(len(content_lines_stripped) - len(search_lines) + 1):
+        candidate_lines = content_lines_stripped[i:i + len(search_lines)]
+        
+        # Calculate line-by-line similarity
+        line_scores = []
+        for search_line, content_line in zip(search_lines, candidate_lines):
+            # Compare stripped versions (ignore leading/trailing whitespace)
+            s_stripped = search_line.strip()
+            c_stripped = content_line.strip()
+            
+            if s_stripped == c_stripped:
+                line_scores.append(1.0)
+            elif not s_stripped and not c_stripped:
+                line_scores.append(1.0)  # Both empty
+            else:
+                # Use sequence matcher for partial matches
+                ratio = difflib.SequenceMatcher(None, s_stripped, c_stripped).ratio()
+                line_scores.append(ratio)
+        
+        if line_scores:
+            avg_score = sum(line_scores) / len(line_scores)
+            # Penalize matches where individual lines are very different
+            min_line_score = min(line_scores) if line_scores else 0
+            adjusted_score = avg_score * 0.7 + min_line_score * 0.3
+            
+            # Apply line hint bonus
+            if line_hint is not None:
+                distance = abs(i - line_hint)
+                hint_bonus = max(0, 0.05 - (distance / 200 * 0.05))
+                adjusted_score += hint_bonus
+            
+            if adjusted_score > best_fuzzy_score:
+                best_fuzzy_score = adjusted_score
+                best_fuzzy_match = (i, i + len(search_lines), adjusted_score, avg_score, min_line_score)
+    
+    if best_fuzzy_match and best_fuzzy_score >= 0.75:
+        start_idx, end_idx, score, avg, min_score = best_fuzzy_match
+        # Lower confidence for fuzzy matches (max 0.65)
+        confidence = 0.4 + (score - 0.75) * 1.0  # 0.75->0.4, 1.0->0.65
+        confidence = min(0.65, max(0.4, confidence))
+        logger.debug(f"Fuzzy match: lines {start_idx}-{end_idx}, avg_sim={avg:.2f}, min_line={min_score:.2f}, confidence={confidence:.2f}")
+        return MatchResult(start_idx, end_idx, "fuzzy", confidence)
+    
+    # No match found - log diagnostic information
+    if search_lines:
+        first_line = search_lines[0].strip()[:60]
+        last_line = search_lines[-1].strip()[:60] if len(search_lines) > 1 else ""
+        logger.debug(f"No match found for search text ({len(search_lines)} lines)")
+        logger.debug(f"  First line: '{first_line}'")
+        if last_line:
+            logger.debug(f"  Last line: '{last_line}'")
+        
+        # Try to find partial matches for diagnostics
+        if first_line:
+            partial_matches = []
+            for i, line in enumerate(content_lines_stripped):
+                if first_line in line.strip() or difflib.SequenceMatcher(None, first_line, line.strip()).ratio() > 0.8:
+                    partial_matches.append((i, line.strip()[:60]))
+            if partial_matches:
+                logger.debug(f"  Possible partial matches for first line:")
+                for line_num, text in partial_matches[:3]:
+                    logger.debug(f"    Line {line_num + 1}: '{text}'")
+    
     return MatchResult(None, None, "", 0.0)
 
 
@@ -434,8 +502,12 @@ def apply_search_replace_list_atomic(
         )
         
         if match_result.start is None:
+            # Log more diagnostic info about the failed match
+            search_preview = search_text[:100].replace('\n', '\\n')
             warning = f"Op {op_num}: Search text not found"
             logger.warning(warning)
+            logger.debug(f"Op {op_num}: Search preview: '{search_preview}...'")
+            logger.debug(f"Op {op_num}: File has {len(content_lines)} lines")
             warnings.append(warning)
             all_found = False
         elif match_result.confidence < min_confidence:
@@ -484,6 +556,10 @@ def apply_search_replace_list_atomic(
     
     if not all_found:
         logger.warning(f"Atomic apply failed: {len(block_plans)}/{len(search_replace_list)} ops valid")
+        # Log which operations failed
+        failed_ops = [i + 1 for i in range(len(search_replace_list)) if not any(p.get("op_num") == i + 1 for p in block_plans)]
+        if failed_ops:
+            logger.debug(f"Failed operations: {failed_ops}")
         return SearchReplaceResult(
             content=original,
             applied_count=0,

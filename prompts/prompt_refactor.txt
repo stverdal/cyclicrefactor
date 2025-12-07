@@ -113,10 +113,24 @@ its replacement
 ```
 
 ## Critical Requirements
-1. For SEARCH/REPLACE: Include enough context (2-3 lines before/after) to uniquely identify the location
-2. SEARCH text must match EXACTLY (including whitespace and indentation)
-3. Ensure all imports are valid after refactoring
-4. Preserve existing public APIs and functionality
-5. Actually REMOVE or INVERT the problematic dependency
+
+### SEARCH Text Matching (VERY IMPORTANT)
+1. **COPY EXACT TEXT** - The SEARCH text must be copied character-for-character from the source code shown above
+2. **INCLUDE CONTEXT** - Include 2-3 lines before AND after the code you want to change
+3. **PRESERVE WHITESPACE** - Keep exact indentation (spaces vs tabs matter)
+4. **DO NOT GUESS** - If you don't see the exact code in the source, don't invent it
+5. **CHECK YOUR SEARCH TEXT** - Before outputting, verify each SEARCH block appears verbatim in the source
+
+### Common Mistakes to Avoid
+- ❌ Changing indentation (4 spaces vs 2 spaces vs tabs)
+- ❌ Adding/removing blank lines
+- ❌ Guessing code that wasn't shown in the source
+- ❌ Using ellipsis (...) or "// existing code" comments
+- ❌ Changing casing or punctuation
+
+### Other Requirements
+1. Ensure all imports are valid after refactoring
+2. Preserve existing public APIs and functionality
+3. Actually REMOVE or INVERT the problematic dependency
 
 Only output the JSON or file markers, no additional commentary.

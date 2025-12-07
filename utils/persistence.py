@@ -147,3 +147,35 @@ class Persistor:
                         df.write(diff_text)
 
         return p
+    
+    def persist_failed_patches(
+        self, 
+        artifact_id: str, 
+        failed_patches: List[Dict[str, Any]]
+    ) -> Optional[Path]:
+        """Persist detailed information about failed patches for later analysis.
+        
+        Args:
+            artifact_id: The artifact/run identifier
+            failed_patches: List of dicts containing:
+                - path: File path that failed
+                - reason: Why the patch failed
+                - original_preview: First/last lines of original file
+                - llm_patch: What the LLM tried to do
+                - warnings: List of warning messages
+                - search_replace_ops: The individual S/R operations if applicable
+                
+        Returns:
+            Path to the saved JSON file, or None if no failures
+        """
+        if not failed_patches:
+            return None
+        
+        # Create a structured failure report
+        failure_report = {
+            "artifact_id": artifact_id,
+            "total_failures": len(failed_patches),
+            "failures": failed_patches,
+        }
+        
+        return self.save_json(artifact_id, "failures/failed_patches.json", failure_report)
