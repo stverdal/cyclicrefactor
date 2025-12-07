@@ -81,15 +81,22 @@ For files over 100 lines, use targeted changes instead of full content:
 {
   "reasoning": "<1-2 sentences explaining your approach>",
   "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
+  "new_files": [
+    {
+      "path": "Interfaces/IMyInterface.cs",
+      "content": "<COMPLETE content of the new file>"
+    }
+  ],
   "changes": [
     {
-      "path": "path/to/file.ext",
+      "path": "path/to/existing_file.ext",
       "search_replace": [
         {
           "search": "<EXACT text from source - include 3+ context lines before AND after>",
           "replace": "<replacement text with same surrounding context>"
         }
-      ]
+      ],
+      "prepend": "<NEW using/import statements to add at START of file>"
     }
   ],
   "notes": "<any additional notes>"
@@ -151,6 +158,38 @@ If NO, fix it or include more context.
 - ❌ Guessing code not shown in source
 - ❌ Using "..." or "// existing code" placeholders
 - ❌ Changing variable casing or punctuation
+- ❌ Searching for text that doesn't exist (to add new code)
+
+### ⚠️ CREATING NEW FILES (Interfaces, Abstractions)
+
+When interface extraction or dependency inversion requires a NEW FILE:
+
+**USE the `new_files` array** - This is the ONLY way to create new files:
+```json
+{
+  "new_files": [
+    {
+      "path": "Interfaces/ITypeResolver.cs",
+      "content": "namespace MyApp.Interfaces\\n{\\n    public interface ITypeResolver\\n    {\\n        Type ResolveType(string name);\\n    }\\n}"
+    }
+  ],
+  "changes": [...]
+}
+```
+
+**RULES for new files:**
+1. `path` - Full relative path including folder (e.g., "Interfaces/IFoo.cs")
+2. `content` - Complete, valid file content (namespace, usings, class/interface)
+3. Put interfaces in a separate folder to avoid new cycles
+
+**DO NOT:**
+- ❌ Use `append` to add interfaces to existing files (creates messy code)
+- ❌ Search for non-existent text to "insert" new files
+- ❌ Forget namespace and using statements in new files
+
+### Adding Imports to Existing Files
+To add new using/import statements to an EXISTING file:
+- **DO** use `"prepend": "using MyApp.Interfaces;"` in the changes entry
 
 ---
 

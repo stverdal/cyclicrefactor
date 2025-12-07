@@ -1,0 +1,38 @@
+# Compact Per-File Prompt (for low-VRAM)
+
+Implement refactoring for this single file.
+
+## Plan
+{plan}
+
+## File: {file_path}
+{file_plan}
+
+## Content
+```
+{file_content}
+```
+
+## Previous Changes
+{previous_changes}
+
+---
+
+## Output (JSON)
+
+```json
+{{
+  "path": "{file_path}",
+  "search_replace": [{{"search": "<3+ context lines from file>", "replace": "<new code>"}}],
+  "append": "<new class/interface to add at END of file>",
+  "prepend": "<new using statements to add at START>"
+}}
+```
+
+RULES:
+- SEARCH must match file content EXACTLY with 3+ context lines
+- For NEW code (new interface/class): use "append" instead of search_replace
+- For NEW using statements: use "prepend"
+- DO NOT search for text that doesn't exist in the file
+
+Output ONLY JSON.

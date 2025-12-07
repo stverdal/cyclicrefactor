@@ -1,0 +1,75 @@
+# Refactor Planning Prompt
+# Phase 1 of sequential file mode - creates a detailed plan for breaking the cycle
+
+You are an expert software engineer. Analyze this cyclic dependency and create a detailed refactoring plan.
+
+## Cycle Information
+- ID: {id}
+- Dependency graph: {graph}
+- Files: {files}
+
+## Problem Description
+{description}
+
+## Source Code Overview
+{file_snippets}
+
+---
+
+## Your Task: Create a Refactoring Plan
+
+Analyze the cycle and produce a step-by-step plan. Do NOT write the actual code patches yet.
+
+### Step 1: Identify the Problematic Dependencies
+- Which specific imports/references create the cycle?
+- What is the direction of each dependency?
+
+### Step 2: Choose a Strategy
+Pick ONE:
+- **interface_extraction**: Create interface, have one class implement it, other depends on interface
+- **dependency_inversion**: Create abstraction in higher layer, lower layer implements it
+- **shared_module**: Extract common code to new module both can import
+
+### Step 3: Plan Changes Per File
+For EACH file, specify:
+- What changes are needed
+- What imports to add/remove
+- What new types/methods to create
+- Order of changes (which file first)
+
+---
+
+## Output Format (JSON)
+
+```json
+{
+  "strategy": "<interface_extraction|dependency_inversion|shared_module>",
+  "summary": "<1-2 sentence summary of the approach>",
+  "new_files": [
+    {
+      "path": "<path for new file if creating one>",
+      "purpose": "<what this file contains>",
+      "content_description": "<describe the interface/class to create>"
+    }
+  ],
+  "file_changes": [
+    {
+      "path": "<existing file path>",
+      "order": 1,
+      "changes": [
+        "<specific change 1: e.g., 'Remove import of ClassB'>",
+        "<specific change 2: e.g., 'Add import of IClassB interface'>",
+        "<specific change 3: e.g., 'Change constructor parameter from ClassB to IClassB'>"
+      ],
+      "imports_to_remove": ["<import statement to remove>"],
+      "imports_to_add": ["<import statement to add>"],
+      "reason": "<why this change helps break the cycle>"
+    }
+  ],
+  "execution_order": ["<file1.cs>", "<file2.cs>"],
+  "notes": "<any additional considerations>"
+}
+```
+
+Be specific about WHAT to change. The actual code will be written in the next phase.
+Output ONLY the JSON object.

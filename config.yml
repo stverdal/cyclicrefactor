@@ -24,6 +24,9 @@ refactor:
   atomic_proposal: true       # All files must succeed or all reverted
   compact_prompts: false      # Use shorter prompts for low-VRAM LLMs
   auto_compact_threshold: 8192  # Auto-enable compact if context below this
+  # Sequential file mode - two-phase approach for better results
+  sequential_file_mode: false   # If true: plan first, then patch each file separately
+  auto_sequential_threshold: 3  # Auto-enable if cycle has >= N files
 
 io:
   artifacts_dir: artifacts
@@ -45,6 +48,10 @@ prompts:
   describer_compact: prompts/prompt_describer_compact.txt
   refactor: prompts/prompt_refactor.txt
   refactor_compact: prompts/prompt_refactor_compact.txt
+  refactor_plan: prompts/prompt_refactor_plan.txt
+  refactor_plan_compact: prompts/prompt_refactor_plan_compact.txt
+  refactor_file: prompts/prompt_refactor_file.txt
+  refactor_file_compact: prompts/prompt_refactor_file_compact.txt
   validator: prompts/prompt_validator.txt
   validator_compact: prompts/prompt_validator_compact.txt
   explainer: prompts/prompt_explainer.txt

@@ -137,6 +137,10 @@ After:
         llm=None,
         prompt_template: str = None,
         prompt_template_compact: str = None,
+        prompt_template_plan: str = None,
+        prompt_template_plan_compact: str = None,
+        prompt_template_file: str = None,
+        prompt_template_file_compact: str = None,
         max_file_chars: int = 4000,
         rag_service=None,
         context_window: int = 4096,
@@ -145,6 +149,10 @@ After:
         self.llm = llm
         self.prompt_template = prompt_template
         self.prompt_template_compact = prompt_template_compact
+        self.prompt_template_plan = prompt_template_plan
+        self.prompt_template_plan_compact = prompt_template_plan_compact
+        self.prompt_template_file = prompt_template_file
+        self.prompt_template_file_compact = prompt_template_file_compact
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
@@ -182,6 +190,32 @@ After:
             logger.debug("Using compact prompt template")
             return self.prompt_template_compact
         return self.prompt_template
+
+    def _should_use_sequential_mode(self, num_files: int) -> bool:
+        """Determine whether to use sequential file mode."""
+        # Explicit config takes precedence
+        if self.refactor_config.sequential_file_mode:
+            return True
+        
+        # Auto-detect based on number of files
+        threshold = getattr(self.refactor_config, 'auto_sequential_threshold', 3)
+        if num_files >= threshold:
+            logger.debug(f"Auto-enabling sequential mode: {num_files} files >= threshold={threshold}")
+            return True
+        
+        return False
+    
+    def _get_plan_template(self) -> Optional[str]:
+        """Get the planning prompt template."""
+        if self.use_compact_prompts and self.prompt_template_plan_compact:
+            return self.prompt_template_plan_compact
+        return self.prompt_template_plan
+    
+    def _get_file_template(self) -> Optional[str]:
+        """Get the per-file execution prompt template."""
+        if self.use_compact_prompts and self.prompt_template_file_compact:
+            return self.prompt_template_file_compact
+        return self.prompt_template_file
 
     def _extract_strategy_from_description(self, description: CycleDescription) -> Optional[str]:
         """Extract the recommended strategy from the Describer's output."""
@@ -289,6 +323,444 @@ After:
 3. Extract Shared Module: Move common code to a new module that both can import,
    eliminating direct dependencies between the original modules.
 """
+
+    # =========================================================================
+    # Sequential File Mode - Two-phase approach
+    # =========================================================================
+    
+    def _build_planning_prompt(
+        self,
+        cycle: CycleSpec,
+        description: CycleDescription,
+    ) -> str:
+        """Build the planning prompt for Phase 1 of sequential mode."""
+        file_paths = cycle.get_file_paths()
+        cycle_dict = cycle.model_dump()
+        
+        # Build file snippets (abbreviated for planning)
+        snippets = []
+        for f in cycle.files:
+            content = f.content or ""
+            # For planning, include first 50 lines + last 20 lines to show structure
+            lines = content.split('\n')
+            if len(lines) > 80:
+                snippet = '\n'.join(lines[:50]) + f"\n\n... ({len(lines) - 70} lines omitted) ...\n\n" + '\n'.join(lines[-20:])
+            else:
+                snippet = content[:self.max_file_chars]
+            snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+        
+        file_snippets = "\n\n".join(snippets)
+        
+        # Load template
+        template_path = self._get_plan_template()
+        if template_path:
+            tpl = load_template(template_path)
+            return safe_format(
+                tpl,
+                id=cycle.id,
+                graph=json.dumps(cycle.graph.model_dump()),
+                files=", ".join(file_paths),
+                description=description.text,
+                file_snippets=file_snippets,
+            )
+        
+        # Fallback inline template
+        return f"""Create a refactoring plan to break this cyclic dependency.
+
+## Cycle: {cycle.id}
+Graph: {json.dumps(cycle.graph.model_dump())}
+Files: {', '.join(file_paths)}
+
+## Description
+{description.text}
+
+## Source Code
+{file_snippets}
+
+Output a JSON plan with: strategy, summary, file_changes (per file), execution_order.
+"""
+
+    def _build_per_file_prompt(
+        self,
+        file_path: str,
+        file_content: str,
+        plan: Dict[str, Any],
+        previous_changes: List[Dict[str, Any]],
+    ) -> str:
+        """Build prompt for Phase 2 - patching a single file."""
+        # Extract file-specific plan
+        file_plan = "No specific plan for this file."
+        for fc in plan.get("file_changes", []):
+            if fc.get("path", "").endswith(file_path.split('/')[-1].split('\\')[-1]):
+                file_plan = json.dumps(fc, indent=2)
+                break
+        
+        # Format previous changes
+        if previous_changes:
+            prev_str = "\n".join([
+                f"- {c.get('path', 'unknown')}: {', '.join(c.get('changes_made', ['changes applied']))}"
+                for c in previous_changes
+            ])
+        else:
+            prev_str = "No changes made yet (this is the first file)."
+        
+        # Load template
+        template_path = self._get_file_template()
+        if template_path:
+            tpl = load_template(template_path)
+            return safe_format(
+                tpl,
+                plan=json.dumps(plan, indent=2),
+                file_path=file_path,
+                file_plan=file_plan,
+                file_content=file_content,
+                previous_changes=prev_str,
+            )
+        
+        # Fallback inline template
+        return f"""Implement the refactoring plan for this file.
+
+## Plan
+{json.dumps(plan, indent=2)}
+
+## File: {file_path}
+{file_plan}
+
+## Content
+```
+{file_content}
+```
+
+## Previous Changes
+{prev_str}
+
+Output JSON with: path, search_replace (list of {{search, replace}}), changes_made.
+Include 3+ lines of context in each SEARCH block.
+"""
+
+    def _run_sequential_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+        validator_feedback: Optional[ValidationReport] = None,
+    ) -> AgentResult:
+        """Run refactoring in sequential file mode (two-phase approach).
+        
+        Phase 1: Generate a plan describing all changes
+        Phase 2: For each file, generate and apply patches
+        
+        Returns:
+            AgentResult with RefactorProposal
+        """
+        logger.info("Running in SEQUENTIAL FILE MODE")
+        
+        # Phase 1: Planning
+        logger.info("Phase 1: Generating refactoring plan...")
+        plan_prompt = self._build_planning_prompt(cycle_spec, description)
+        logger.debug(f"Planning prompt: {len(plan_prompt)} chars")
+        
+        try:
+            plan_response = call_llm(self.llm, plan_prompt)
+            logger.debug(f"Plan response: {len(str(plan_response))} chars")
+            
+            # Parse the plan
+            plan = self._parse_plan_response(plan_response)
+            if not plan:
+                logger.error("Failed to parse planning response")
+                return AgentResult(
+                    status="error",
+                    output=None,
+                    logs="Failed to parse refactoring plan from LLM response"
+                )
+            
+            strategy = plan.get("strategy", "unknown")
+            logger.info(f"Plan generated: strategy={strategy}, files={len(plan.get('file_changes', []))}")
+            
+        except Exception as e:
+            logger.error(f"Planning phase failed: {e}")
+            return AgentResult(status="error", output=None, logs=f"Planning failed: {e}")
+        
+        # Determine execution order
+        execution_order = plan.get("execution_order", [])
+        if not execution_order:
+            execution_order = [f.path for f in cycle_spec.files]
+        
+        # Phase 2: Per-file execution
+        logger.info(f"Phase 2: Executing patches for {len(execution_order)} files...")
+        
+        all_inferred: List[Dict[str, Any]] = []
+        previous_changes: List[Dict[str, Any]] = []
+        llm_responses: List[str] = [str(plan_response)]
+        
+        # Handle new files first (if any)
+        for new_file in plan.get("new_files", []):
+            new_path = new_file.get("path", "")
+            if new_path:
+                logger.info(f"Creating new file: {new_path}")
+                # Generate content for new file
+                new_file_prompt = self._build_new_file_prompt(new_file, plan)
+                try:
+                    new_file_response = call_llm(self.llm, new_file_prompt)
+                    llm_responses.append(str(new_file_response))
+                    new_content = self._parse_new_file_response(new_file_response)
+                    if new_content:
+                        all_inferred.append({
+                            "path": new_path,
+                            "patched": new_content,
+                            "is_new_file": True,
+                        })
+                        previous_changes.append({
+                            "path": new_path,
+                            "changes_made": ["Created new file"],
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to create new file {new_path}: {e}")
+        
+        # Process each existing file
+        for file_path in execution_order:
+            # Find the file content
+            file_content = None
+            for f in cycle_spec.files:
+                if f.path == file_path or f.path.endswith(file_path.split('/')[-1].split('\\')[-1]):
+                    file_content = f.content
+                    file_path = f.path  # Use the full path
+                    break
+            
+            if file_content is None:
+                logger.warning(f"File not found in cycle spec: {file_path}")
+                continue
+            
+            logger.info(f"Processing file: {file_path}")
+            
+            # Build per-file prompt
+            file_prompt = self._build_per_file_prompt(
+                file_path, file_content, plan, previous_changes
+            )
+            logger.debug(f"Per-file prompt: {len(file_prompt)} chars")
+            
+            try:
+                file_response = call_llm(self.llm, file_prompt)
+                llm_responses.append(str(file_response))
+                logger.debug(f"File response: {len(str(file_response))} chars")
+                
+                # Parse the per-file response
+                file_patches = self._parse_per_file_response(file_response, file_path)
+                
+                if file_patches:
+                    all_inferred.append(file_patches)
+                    previous_changes.append({
+                        "path": file_path,
+                        "changes_made": file_patches.get("changes_made", ["patches applied"]),
+                    })
+                    logger.info(f"  -> {len(file_patches.get('search_replace', []))} search/replace operations")
+                else:
+                    logger.warning(f"  -> No patches parsed for {file_path}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to process {file_path}: {e}")
+                continue
+        
+        # Now process all inferred patches
+        logger.info(f"Applying patches from {len(all_inferred)} file responses...")
+        
+        # Convert to the format expected by _process_single_file_patch
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        
+        # Build inferred list in standard format
+        normalized_inferred = []
+        for inf in all_inferred:
+            if inf.get("is_new_file"):
+                # New file - add as full patched content
+                normalized_inferred.append({
+                    "path": inf["path"],
+                    "patched": inf["patched"],
+                })
+            elif "search_replace" in inf or "append" in inf or "prepend" in inf:
+                # Search/replace and/or append/prepend format
+                entry = {"path": inf["path"]}
+                if "search_replace" in inf:
+                    entry["search_replace"] = inf["search_replace"]
+                if "append" in inf:
+                    entry["append"] = inf["append"]
+                if "prepend" in inf:
+                    entry["prepend"] = inf["prepend"]
+                normalized_inferred.append(entry)
+            elif "patched" in inf:
+                normalized_inferred.append(inf)
+        
+        # Process each file
+        processing_results: List[PatchProcessingResult] = []
+        
+        for f in cycle_spec.files:
+            result = self._process_single_file_patch(
+                path=f.path,
+                original=f.content or "",
+                inferred=normalized_inferred,
+            )
+            processing_results.append(result)
+        
+        # Handle new files
+        for inf in all_inferred:
+            if inf.get("is_new_file"):
+                processing_results.append(PatchProcessingResult(
+                    path=inf["path"],
+                    original="",
+                    patched=inf["patched"],
+                    diff=f"New file created with {len(inf['patched'])} chars",
+                    status="applied",
+                    warnings=[],
+                    confidence=1.0,
+                    applied_blocks=1,
+                    total_blocks=1,
+                    revert_reason="",
+                    pre_validated=False,
+                    validation_issues=[],
+                    has_critical_error=False,
+                    original_patched=None,
+                ))
+        
+        # Build final proposal (reuse existing logic for atomic handling)
+        return self._build_proposal_from_results(
+            processing_results, 
+            "\n---\n".join(llm_responses),
+            plan.get("strategy", "sequential_mode")
+        )
+    
+    def _parse_plan_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """Parse the planning phase LLM response."""
+        try:
+            text = response if isinstance(response, str) else str(response)
+            # Find JSON in response
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                return json.loads(json_match.group())
+        except Exception as e:
+            logger.warning(f"Failed to parse plan response: {e}")
+        return None
+    
+    def _parse_per_file_response(self, response: str, file_path: str) -> Optional[Dict[str, Any]]:
+        """Parse the per-file execution response."""
+        try:
+            text = response if isinstance(response, str) else str(response)
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                data = json.loads(json_match.group())
+                # Ensure path is set
+                if "path" not in data:
+                    data["path"] = file_path
+                return data
+        except Exception as e:
+            logger.warning(f"Failed to parse per-file response: {e}")
+        return None
+    
+    def _build_new_file_prompt(self, new_file_spec: Dict[str, Any], plan: Dict[str, Any]) -> str:
+        """Build prompt for creating a new file."""
+        return f"""Create the following new file as part of a refactoring.
+
+## New File Details
+- Path: {new_file_spec.get('path', 'unknown')}
+- Purpose: {new_file_spec.get('purpose', 'unknown')}
+- Description: {new_file_spec.get('content_description', 'No description')}
+
+## Refactoring Plan Context
+Strategy: {plan.get('strategy', 'unknown')}
+Summary: {plan.get('summary', '')}
+
+Output ONLY the complete file content, no JSON wrapper. Start directly with the code.
+"""
+    
+    def _parse_new_file_response(self, response: str) -> Optional[str]:
+        """Parse the new file creation response."""
+        text = response if isinstance(response, str) else str(response)
+        # Remove any markdown code blocks
+        text = re.sub(r'^```\w*\n?', '', text.strip())
+        text = re.sub(r'\n?```$', '', text.strip())
+        return text if text else None
+    
+    def _build_proposal_from_results(
+        self,
+        processing_results: List[PatchProcessingResult],
+        llm_response: str,
+        strategy: str = "unknown",
+    ) -> AgentResult:
+        """Build AgentResult from processing results (shared by both modes)."""
+        # Check atomic proposal settings
+        atomic_proposal = self.refactor_config.atomic_proposal
+        revert_on_critical = self.refactor_config.revert_on_any_critical
+        
+        has_any_critical = any(r.has_critical_error for r in processing_results)
+        has_any_failed = any(r.status == "failed" for r in processing_results)
+        
+        revert_all = False
+        revert_all_reason = ""
+        
+        if atomic_proposal:
+            if has_any_critical and revert_on_critical:
+                critical_files = [r.path for r in processing_results if r.has_critical_error]
+                revert_all = True
+                revert_all_reason = f"Atomic proposal mode: critical errors in {critical_files}"
+                logger.error(f"Atomic proposal: reverting all {len(processing_results)} files due to critical errors in: {critical_files}")
+            elif has_any_failed:
+                failed_files = [r.path for r in processing_results if r.status == "failed"]
+                revert_all = True
+                revert_all_reason = f"Atomic proposal mode: failed files {failed_files}"
+                logger.error(f"Atomic proposal: reverting all {len(processing_results)} files due to failures in: {failed_files}")
+        
+        # Build patches and reverted lists
+        patches = []
+        reverted_files = []
+        
+        for result in processing_results:
+            if revert_all and result.status not in ("unchanged",):
+                # Revert this file
+                reverted_files.append(RevertedFile(
+                    path=result.path,
+                    reason=revert_all_reason,
+                    warnings=result.warnings,
+                    original_patched=result.patched if result.patched != result.original else None,
+                ))
+                patches.append(Patch(
+                    path=result.path,
+                    original=result.original,
+                    patched=result.original,  # Revert to original
+                    diff="",
+                    status="reverted",
+                    warnings=result.warnings,
+                    confidence=result.confidence,
+                    applied_blocks=0,
+                    total_blocks=result.total_blocks,
+                    revert_reason=revert_all_reason,
+                ))
+            else:
+                patches.append(Patch(
+                    path=result.path,
+                    original=result.original,
+                    patched=result.patched,
+                    diff=result.diff,
+                    status=result.status,
+                    warnings=result.warnings,
+                    confidence=result.confidence,
+                    applied_blocks=result.applied_blocks,
+                    total_blocks=result.total_blocks,
+                    revert_reason=result.revert_reason,
+                    pre_validated=result.pre_validated,
+                    validation_issues=result.validation_issues,
+                ))
+        
+        # Count results
+        changed = len([p for p in patches if p.diff and p.status == "applied"])
+        reverted = len(reverted_files)
+        
+        logger.info(f"RefactorAgent completed: {changed}/{len(patches)} files changed, {reverted} reverted (atomic={atomic_proposal})")
+        
+        proposal = RefactorProposal(
+            patches=patches,
+            reverted_files=reverted_files,
+            rationale=f"Sequential mode with strategy: {strategy}",
+            llm_response=llm_response,
+        )
+        
+        return AgentResult(status="success", output=proposal.model_dump())
 
     def _build_prompt(self, cycle: CycleSpec, description: CycleDescription) -> str:
         """Basic prompt builder (kept for compatibility)."""
@@ -1062,6 +1534,29 @@ public class Foo : INewInterface
                     patch_status = "applied"
                 
                 logger.debug(f"Applied JSON-style search/replace to {path}: {applied_blocks}/{total_blocks}")
+            
+            # Handle append/prepend operations (can be combined with search_replace OR used alone)
+            append_content = patched_entry.get("append")
+            prepend_content = patched_entry.get("prepend")
+            
+            if append_content or prepend_content:
+                from utils.patch_applier import apply_append_prepend
+                new_content, append_warnings = apply_append_prepend(
+                    patched, append=append_content, prepend=prepend_content
+                )
+                if new_content != patched:
+                    patched = new_content
+                    patch_warnings.extend(append_warnings)
+                    # If this was an append-only patch (no search_replace), mark as applied
+                    if patch_status == "unchanged":
+                        patch_status = "applied"
+                        patch_confidence = 1.0  # Append operations have full confidence
+                    applied_blocks += 1
+                    total_blocks += 1
+                    logger.info(f"Applied append/prepend to {path}")
+                elif patch_status == "unchanged" and (append_content or prepend_content):
+                    # Append/prepend was requested but nothing changed - might be empty content
+                    logger.warning(f"Append/prepend for {path} produced no changes")
         
         # Log warnings
         for warning in patch_warnings:
@@ -1179,6 +1674,17 @@ public class Foo : INewInterface
             validator_feedback = ValidationReport.model_validate(validator_feedback)
             logger.info(f"Retry with feedback: {len(validator_feedback.issues)} issues, {len(validator_feedback.suggestions)} suggestions")
 
+        # Check if we should use sequential file mode
+        num_files = len(cycle_spec.files)
+        use_sequential = self._should_use_sequential_mode(num_files)
+        
+        if use_sequential and self.llm is not None and validator_feedback is None:
+            # Use sequential mode for initial attempts (not retries with feedback)
+            logger.info(f"Using sequential file mode for {num_files} files")
+            return self._run_sequential_mode(cycle_spec, description, validator_feedback)
+        elif use_sequential and validator_feedback is not None:
+            logger.info("Sequential mode disabled for retry (using standard mode with feedback)")
+
         # Extract strategy hint from description
         strategy = self._extract_strategy_from_description(description)
         if strategy:
@@ -1243,6 +1749,30 @@ public class Foo : INewInterface
                     inferred=inferred,
                 )
                 processing_results.append(result)
+            
+            # Handle new files (interface extraction, shared modules, etc.)
+            for inf in inferred:
+                if inf.get("is_new_file") and inf.get("patched"):
+                    new_path = inf.get("path", "")
+                    new_content = inf.get("patched", "")
+                    if new_path and new_content:
+                        logger.info(f"Adding new file: {new_path}")
+                        processing_results.append(PatchProcessingResult(
+                            path=new_path,
+                            original="",
+                            patched=new_content,
+                            diff=f"New file created with {len(new_content)} chars",
+                            status="applied",
+                            warnings=[],
+                            confidence=1.0,
+                            applied_blocks=1,
+                            total_blocks=1,
+                            revert_reason="",
+                            pre_validated=False,
+                            validation_issues=[],
+                            has_critical_error=False,
+                            original_patched=None,
+                        ))
             
             # Phase 2: Check if atomic proposal mode should revert everything
             atomic_proposal = self.refactor_config.atomic_proposal

@@ -779,3 +779,61 @@ def apply_search_replace_list_simple(
     """
     result = apply_search_replace_list_atomic(original, search_replace_list)
     return result.content, result.warnings
+
+
+def apply_append_prepend(
+    original: str,
+    append: Optional[str] = None,
+    prepend: Optional[str] = None
+) -> Tuple[str, List[str]]:
+    """Apply append/prepend content to a file.
+    
+    This handles adding new content to files without needing SEARCH/REPLACE.
+    Use append to add content at the end of the file (e.g., new interfaces, classes).
+    Use prepend to add content at the start of the file (e.g., new imports).
+    
+    Args:
+        original: Original file content
+        append: Optional content to add at end of file
+        prepend: Optional content to add at start of file
+    
+    Returns:
+        Tuple of (result_content, list_of_warnings)
+    """
+    original = normalize_line_endings(original)
+    result = original
+    warnings = []
+    
+    # Apply prepend first
+    if prepend:
+        prepend = normalize_line_endings(prepend)
+        # Check if it looks truncated
+        truncation = check_truncation(prepend, "prepend")
+        if truncation:
+            warnings.append(f"Prepend content may be truncated: {truncation}")
+        
+        # Add prepend content, ensure proper line separation
+        if result and not prepend.endswith('\n'):
+            prepend = prepend + '\n'
+        result = prepend + result
+        logger.info(f"Prepended {len(prepend)} chars to file")
+    
+    # Apply append
+    if append:
+        append = normalize_line_endings(append)
+        # Check if it looks truncated
+        truncation = check_truncation(append, "append")
+        if truncation:
+            warnings.append(f"Append content may be truncated: {truncation}")
+        
+        # Add append content, ensure proper line separation
+        if result and not result.endswith('\n'):
+            result = result + '\n'
+        # Ensure there's a blank line before new content if it's a class/interface
+        if append.strip().startswith(('public ', 'internal ', 'private ', 'namespace ', 'using ', 'class ', 'interface ')):
+            if result and not result.endswith('\n\n'):
+                result = result.rstrip('\n') + '\n\n'
+        result = result + append
+        logger.info(f"Appended {len(append)} chars to file")
+    
+    return result, warnings

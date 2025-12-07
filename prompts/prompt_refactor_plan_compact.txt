@@ -1,0 +1,36 @@
+# Compact Planning Prompt (for low-VRAM)
+
+Create a refactoring plan for this cyclic dependency.
+
+## Cycle: {id}
+Graph: {graph}
+Files: {files}
+
+## Description
+{description}
+
+## Source Code
+{file_snippets}
+
+---
+
+## Output (JSON)
+
+```json
+{
+  "strategy": "<interface_extraction|dependency_inversion|shared_module>",
+  "summary": "<brief approach>",
+  "new_files": [{"path": "<new file>", "purpose": "<what it contains>"}],
+  "file_changes": [
+    {
+      "path": "<file>",
+      "order": 1,
+      "changes": ["<change 1>", "<change 2>"],
+      "reason": "<why>"
+    }
+  ],
+  "execution_order": ["<file1>", "<file2>"]
+}
+```
+
+Be specific. Output ONLY JSON.

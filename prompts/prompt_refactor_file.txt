@@ -1,0 +1,91 @@
+# Per-File Refactor Prompt
+# Phase 2 of sequential file mode - generates patches for a single file
+
+You are an expert software engineer implementing a refactoring plan.
+
+## Refactoring Plan
+{plan}
+
+## Current File to Modify
+**Path:** {file_path}
+
+**Planned Changes for This File:**
+{file_plan}
+
+## File Content
+```
+{file_content}
+```
+
+## Changes Already Made
+{previous_changes}
+
+---
+
+## Your Task
+
+Generate patches for **this file only** ({file_path}).
+
+Follow the plan exactly. Implement the changes specified for this file.
+
+## Output Format (JSON)
+
+```json
+{{
+  "path": "{file_path}",
+  "search_replace": [
+    {{
+      "search": "<EXACT text from file - include 3+ context lines before AND after>",
+      "replace": "<replacement text with same context>"
+    }}
+  ],
+  "append": "<NEW content to add at END of file - for new classes/interfaces>",
+  "prepend": "<NEW content to add at START of file - for new using statements>",
+  "changes_made": ["<description of change 1>", "<description of change 2>"]
+}}
+```
+
+## ⚠️ CRITICAL RULES
+
+### For MODIFYING Existing Code (search_replace):
+1. **COPY FROM FILE CONTENT ABOVE** - Find the exact lines, copy character-for-character
+2. **INCLUDE 3+ LINES OF CONTEXT** - Before AND after the code you're changing
+3. **PRESERVE WHITESPACE** - Exact indentation matters (spaces vs tabs)
+
+### For ADDING New Content:
+- **NEW INTERFACE/CLASS** → Use `"append": "your new code"` to add at end of file
+- **NEW IMPORTS/USING** → Use `"prepend": "using Namespace;"` to add at start of file  
+- **DO NOT search for text that doesn't exist** - if adding new code, use append/prepend
+
+### Examples
+
+❌ BAD - Searching for non-existent text to add new content:
+```json
+{{"search": "// Add new interface here", "replace": "public interface IFoo {{}}"}}
+```
+
+✅ GOOD - Using append for new interface:
+```json
+{{
+  "path": "MyFile.cs",
+  "append": "public interface ITypeResolver\n{{\n    Type ResolveType(string name);\n}}",
+  "changes_made": ["Added ITypeResolver interface"]
+}}
+```
+
+✅ GOOD - Using prepend for new imports:
+```json
+{{
+  "path": "MyFile.cs",
+  "prepend": "using MyProject.Interfaces;",
+  "search_replace": [...],
+  "changes_made": ["Added using statement", "Modified class"]
+}}
+```
+
+✅ GOOD - search/replace with context:
+```json
+{{"search": "    [JsonPropertyName(\"type\")]\n    public SensorType Type {{ get; set; }}\n\n    [JsonPropertyName(\"value\")]", "replace": "..."}}
+```
+
+Output ONLY the JSON object for this single file.

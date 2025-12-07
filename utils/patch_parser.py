@@ -9,13 +9,141 @@ This module provides functions to parse various LLM output formats:
 Extracted from refactor_agent.py for better separation of concerns.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import json
 import re
+import os
 
 from utils.logging import get_logger
 
 logger = get_logger("patch_parser")
+
+
+def validate_new_file_path(path: str, existing_paths: List[str] = None) -> Tuple[bool, str]:
+    """Validate a new file path for safety and sanity.
+    
+    Checks for:
+    - Valid file extension
+    - No path traversal (..)
+    - Reasonable path length
+    - Not conflicting with existing files
+    - Looks like a real source file path
+    
+    Args:
+        path: The file path to validate
+        existing_paths: Optional list of existing file paths to check for conflicts
+        
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not path:
+        return False, "Empty path"
+    
+    # Normalize path separators
+    path = path.replace("\\", "/")
+    
+    # Check for path traversal
+    if ".." in path:
+        return False, "Path traversal detected (..)"
+    
+    # Check for absolute paths (security concern)
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return False, "Absolute paths not allowed"
+    
+    # Check path length
+    if len(path) > 260:  # Windows MAX_PATH
+        return False, "Path too long"
+    
+    # Check for valid file extension
+    valid_extensions = {
+        ".cs", ".py", ".js", ".ts", ".java", ".go", ".rs", ".cpp", ".c", ".h",
+        ".hpp", ".rb", ".php", ".swift", ".kt", ".scala", ".fs", ".vb",
+        ".tsx", ".jsx", ".vue", ".svelte"
+    }
+    _, ext = os.path.splitext(path)
+    if ext.lower() not in valid_extensions:
+        return False, f"Invalid file extension: {ext}"
+    
+    # Check for suspicious patterns (hallucination indicators)
+    suspicious_patterns = [
+        r"example\.",
+        r"test_interface",
+        r"my_new_",
+        r"placeholder",
+        r"todo_",
+        r"<[^>]+>",  # XML/HTML tags in path
+        r"\$\{",  # Template variables
+    ]
+    for pattern in suspicious_patterns:
+        if re.search(pattern, path, re.IGNORECASE):
+            logger.warning(f"Suspicious pattern in new file path: {path}")
+            # Don't reject, just warn - the LLM might legitimately use these
+    
+    # Check for conflict with existing files
+    if existing_paths:
+        normalized_existing = [p.replace("\\", "/").lower() for p in existing_paths]
+        if path.lower() in normalized_existing:
+            return False, f"File already exists: {path}"
+    
+    return True, ""
+
+
+def validate_new_file_content(content: str, path: str) -> Tuple[bool, List[str]]:
+    """Validate new file content for basic sanity.
+    
+    Checks for:
+    - Non-empty content
+    - Reasonable length
+    - Contains expected constructs for file type
+    
+    Args:
+        content: The file content to validate
+        path: The file path (for determining expected constructs)
+        
+    Returns:
+        Tuple of (is_valid, list_of_warnings)
+    """
+    warnings = []
+    
+    if not content or not content.strip():
+        return False, ["Empty content"]
+    
+    # Check for very short content (likely incomplete)
+    if len(content.strip()) < 20:
+        warnings.append("Content very short, may be incomplete")
+    
+    # Check for truncation indicators
+    truncation_patterns = [
+        r"\.\.\.\s*$",
+        r"//\s*\.\.\.\s*$",
+        r"#\s*\.\.\.\s*$",
+        r"//\s*continue",
+        r"//\s*rest of",
+        r"//\s*TODO:",
+    ]
+    for pattern in truncation_patterns:
+        if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
+            warnings.append("Content may be truncated")
+            break
+    
+    # Check for expected constructs based on extension
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    
+    if ext == ".cs":
+        if "namespace" not in content and "class" not in content and "interface" not in content:
+            warnings.append("C# file missing namespace/class/interface")
+    elif ext in (".js", ".ts", ".jsx", ".tsx"):
+        if "export" not in content and "function" not in content and "class" not in content and "const" not in content:
+            warnings.append("JavaScript/TypeScript file missing exports/functions/classes")
+    elif ext == ".py":
+        if "def " not in content and "class " not in content and "import " not in content:
+            warnings.append("Python file missing definitions/imports")
+    elif ext == ".java":
+        if "class " not in content and "interface " not in content and "enum " not in content:
+            warnings.append("Java file missing class/interface/enum")
+    
+    return len(warnings) == 0 or not any("missing" in w for w in warnings), warnings
 
 
 def parse_json_patches(text: str) -> List[Dict[str, str]]:
@@ -316,16 +444,36 @@ def parse_search_replace_json(text: str) -> List[Dict[str, Any]]:
               "path": "file.cs",
               "search_replace": [
                 {"search": "old code", "replace": "new code"}
-              ]
+              ],
+              "append": "new code to add at end of file",
+              "prepend": "new code to add at start of file"
+            }
+          ],
+          "new_files": [
+            {
+              "path": "Interfaces/IFoo.cs",
+              "content": "namespace MyApp { public interface IFoo { } }"
             }
           ]
+        }
+    
+    Also supports single-file format (without "changes" wrapper):
+        {
+          "path": "file.cs",
+          "search_replace": [...],
+          "append": "..."
         }
     
     Args:
         text: Raw LLM response text
         
     Returns:
-        List of dicts with 'path' and 'search_replace' keys
+        List of dicts with 'path' and optionally:
+        - 'search_replace': List of {search, replace} dicts
+        - 'append': String to add at end of file
+        - 'prepend': String to add at start of file
+        - 'patched': Full content for new files (with is_new_file=True)
+        - 'is_new_file': Boolean indicating this is a new file
     """
     try:
         # Strip markdown wrapper
@@ -342,20 +490,76 @@ def parse_search_replace_json(text: str) -> List[Dict[str, Any]]:
             return []
         
         data = json.loads(json_match.group())
-        changes = data.get("changes", [])
         
-        if not changes:
+        # Handle single-file format (no "changes" wrapper)
+        if "path" in data and ("search_replace" in data or "append" in data or "prepend" in data):
+            changes = [data]
+        else:
+            changes = data.get("changes", [])
+        
+        # Get new_files array
+        new_files = data.get("new_files", [])
+        
+        # Return early only if nothing to process
+        if not changes and not new_files:
             return []
         
         result = []
         for change in changes:
             path = change.get("path")
+            if not path:
+                continue
+                
+            entry = {"path": path}
+            
+            # Extract search_replace operations
             search_replace = change.get("search_replace", [])
-            if path and search_replace:
-                result.append({
-                    "path": path,
-                    "search_replace": search_replace
-                })
+            if search_replace:
+                entry["search_replace"] = search_replace
+            
+            # Extract append content (add at end of file)
+            append_content = change.get("append")
+            if append_content:
+                entry["append"] = append_content
+            
+            # Extract prepend content (add at start of file)
+            prepend_content = change.get("prepend")
+            if prepend_content:
+                entry["prepend"] = prepend_content
+            
+            # Only add if we have at least one operation
+            if "search_replace" in entry or "append" in entry or "prepend" in entry:
+                result.append(entry)
+        
+        # Collect existing paths for conflict detection
+        existing_paths = [change.get("path", "") for change in changes if change.get("path")]
+        
+        # Handle new_files array (for creating brand new files like interfaces)
+        # new_files was already retrieved above
+        for new_file in new_files:
+            path = new_file.get("path")
+            content = new_file.get("content")
+            if path and content:
+                # Validate the new file path
+                path_valid, path_error = validate_new_file_path(path, existing_paths)
+                if not path_valid:
+                    logger.warning(f"Invalid new file path '{path}': {path_error}")
+                    continue
+                
+                # Validate the content
+                content_valid, content_warnings = validate_new_file_content(content, path)
+                for warning in content_warnings:
+                    logger.warning(f"New file '{path}': {warning}")
+                
+                if content_valid:
+                    result.append({
+                        "path": path,
+                        "patched": content,
+                        "is_new_file": True,
+                    })
+                    logger.debug(f"Parsed new file: {path}")
+                else:
+                    logger.warning(f"Rejected new file '{path}' due to invalid content")
         
         return result
     except Exception as e:
@@ -374,10 +578,13 @@ def infer_patches(llm_response: Any, cycle_files: List[Dict[str, Any]] = None) -
         cycle_files: Optional list of cycle files for context (unused currently)
     
     Returns:
-        List of dicts with either:
+        List of dicts with combinations of:
         - {"path": str, "patched": str} for full content patches
+        - {"path": str, "patched": str, "is_new_file": True} for new file creation
         - {"path": str, "search_replace_blocks": str} for marker-style S/R
         - {"path": str, "search_replace": List[Dict]} for JSON-style S/R
+        - {"path": str, "append": str} for content to add at end of file
+        - {"path": str, "prepend": str} for content to add at start of file
     """
     import json as json_module
     text = llm_response if isinstance(llm_response, str) else json_module.dumps(llm_response)

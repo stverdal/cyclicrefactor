@@ -34,6 +34,9 @@ class RefactorConfig(BaseModel):
     revert_on_compile_error: bool = True  # If True, revert files that fail compile check
     compact_prompts: bool = False       # If True, use shorter prompts for low-VRAM/small context LLMs
     auto_compact_threshold: int = 8192  # Auto-enable compact prompts if context window below this
+    # Sequential file mode - process files one at a time
+    sequential_file_mode: bool = False  # If True, use two-phase approach: plan then per-file execution
+    auto_sequential_threshold: int = 3  # Auto-enable sequential mode if cycle has >= this many files
 
 
 class IOConfig(BaseModel):
