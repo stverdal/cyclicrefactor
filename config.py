@@ -21,6 +21,19 @@ class RetrieverConfig(BaseModel):
     search_kwargs: Dict[str, Any] = {"k": 4}
 
 
+class RefactorConfig(BaseModel):
+    """Configuration for the RefactorAgent's SEARCH/REPLACE matching behavior."""
+    min_match_confidence: float = 0.7  # Minimum confidence to accept a match
+    warn_confidence: float = 0.85       # Warn if confidence below this (but still apply)
+    allow_low_confidence: bool = False  # If True, accept matches below min_confidence with warning
+    atomic_mode: bool = True            # If True, all SEARCH/REPLACE blocks must succeed or none applied
+    atomic_proposal: bool = True        # If True, all files in proposal must succeed or all are reverted
+    revert_on_any_critical: bool = True # If True, revert entire proposal if any file has critical errors
+    compile_check: bool = False         # If True, run language-specific compile/lint check on patches
+    compile_check_timeout: int = 30     # Timeout in seconds for compile commands
+    revert_on_compile_error: bool = True  # If True, revert files that fail compile check
+
+
 class IOConfig(BaseModel):
     artifacts_dir: str = "artifacts"
     cyclic_folder: str = "cyclicDepen"
@@ -28,14 +41,17 @@ class IOConfig(BaseModel):
 
 
 class PipelineConfig(BaseModel):
-    agents_order: list = ["describer", "refactor", "validator"]
+    agents_order: list = ["describer", "refactor", "validator", "explainer"]
     max_iterations: int = 1
-    enable: Dict[str, bool] = {"describer": True, "refactor": True, "validator": True}
+    enable: Dict[str, bool] = {"describer": True, "refactor": True, "validator": True, "explainer": True}
+    dry_run: bool = False  # If True, run pipeline without writing any files
+    dry_run_log_writes: bool = True  # If True, log what would be written in dry-run mode
 
 
 class AppConfig(BaseModel):
     llm: LLMConfig = LLMConfig()
     retriever: RetrieverConfig = RetrieverConfig()
+    refactor: RefactorConfig = RefactorConfig()
     io: IOConfig = IOConfig()
     pipeline: PipelineConfig = PipelineConfig()
     auth: Dict[str, str] = {}

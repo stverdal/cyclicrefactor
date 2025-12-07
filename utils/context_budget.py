@@ -333,6 +333,8 @@ def prioritize_cycle_files(
     graph: Dict[str, Any],
     validation_issues: Optional[List[Dict[str, Any]]] = None,
     total_char_budget: int = 12000,
+    strategy_hint: Optional[str] = None,
+    edge_focus: Optional[List[List[str]]] = None,
 ) -> List[FilePriority]:
     """Prioritize files in a cycle for context inclusion.
     
@@ -341,12 +343,16 @@ def prioritize_cycle_files(
     2. Files at cycle "joints" (have both incoming and outgoing edges)
     3. Files with more connections in the cycle
     4. Smaller files (easier to include completely)
+    5. Strategy-aware prioritization (e.g., interfaces for interface_extraction)
+    6. Edge focus (prioritize files involved in specific problematic edges)
     
     Args:
         files: List of file dicts with 'path' and 'content'
         graph: Graph dict with 'nodes' and 'edges'
         validation_issues: List of issues from failed validation
         total_char_budget: Total character budget to distribute
+        strategy_hint: Suggested refactoring strategy (e.g., "interface_extraction")
+        edge_focus: Specific edges to focus on [[from, to], ...]
         
     Returns:
         List of FilePriority objects sorted by priority (highest first)
@@ -365,6 +371,15 @@ def prioritize_cycle_files(
                 outgoing[src] += 1
             if dst in incoming:
                 incoming[dst] += 1
+    
+    # Build edge focus set for quick lookup
+    focus_nodes = set()
+    if edge_focus:
+        for edge in edge_focus:
+            if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                focus_nodes.add(edge[0])
+                focus_nodes.add(edge[1])
+        logger.info(f"Edge focus: prioritizing nodes {focus_nodes}")
     
     # Map file paths to node names (heuristic: basename or path contains node)
     def file_matches_node(path: str, node: str) -> bool:
@@ -395,21 +410,28 @@ def prioritize_cycle_files(
                     reasons.append("mentioned in validation issue")
                     break
         
-        # 2. Cycle joints (both incoming and outgoing)
+        # 2. Edge focus (specific edges to break)
+        for node in matching_nodes:
+            if node in focus_nodes:
+                score += 40
+                reasons.append("focus edge node")
+                break
+        
+        # 3. Cycle joints (both incoming and outgoing)
         for node in matching_nodes:
             if incoming.get(node, 0) > 0 and outgoing.get(node, 0) > 0:
                 score += 30
                 reasons.append(f"cycle joint ({node})")
                 break
         
-        # 3. Connection count
+        # 4. Connection count
         for node in matching_nodes:
             connections = incoming.get(node, 0) + outgoing.get(node, 0)
             if connections > 0:
                 score += connections * 10
                 reasons.append(f"{connections} connections")
         
-        # 4. File size (prefer smaller files - easier to include completely)
+        # 5. File size (prefer smaller files - easier to include completely)
         if content_len < 1000:
             score += 15
             reasons.append("small file")
@@ -420,7 +442,7 @@ def prioritize_cycle_files(
             score -= 10
             reasons.append("large file (may truncate)")
         
-        # 5. Interface files (often key to breaking cycles)
+        # 6. Interface files (often key to breaking cycles)
         basename = path.split("/")[-1].lower()
         if basename.startswith("i") and basename[1:2].isupper():
             score += 20
@@ -429,10 +451,43 @@ def prioritize_cycle_files(
             score += 20
             reasons.append("interface file")
         
-        # 6. Model/Entity files (often involved in cycles)
+        # 7. Model/Entity files (often involved in cycles)
         if any(x in basename for x in ["model", "entity", "dto"]):
             score += 5
             reasons.append("model/entity file")
+        
+        # 8. Strategy-aware prioritization
+        if strategy_hint:
+            if strategy_hint == "interface_extraction":
+                # Prioritize files that could use interfaces (concrete classes)
+                if not basename.startswith("i") and not "interface" in basename:
+                    # Prioritize files with high outgoing deps (depend on many things)
+                    for node in matching_nodes:
+                        if outgoing.get(node, 0) >= 2:
+                            score += 25
+                            reasons.append("interface extraction candidate")
+                            break
+            elif strategy_hint == "dependency_inversion":
+                # Prioritize high-level modules (few outgoing, many incoming)
+                for node in matching_nodes:
+                    if incoming.get(node, 0) > outgoing.get(node, 0):
+                        score += 20
+                        reasons.append("high-level module (DI candidate)")
+                        break
+            elif strategy_hint == "shared_module":
+                # Prioritize files that are depended on by multiple nodes
+                for node in matching_nodes:
+                    if incoming.get(node, 0) >= 2:
+                        score += 20
+                        reasons.append("shared module candidate")
+                        break
+            elif strategy_hint == "mediator":
+                # Prioritize files with bidirectional dependencies
+                for node in matching_nodes:
+                    if incoming.get(node, 0) > 0 and outgoing.get(node, 0) > 0:
+                        score += 25
+                        reasons.append("mediator pattern candidate")
+                        break
         
         priorities.append(FilePriority(
             path=path,
@@ -455,7 +510,7 @@ def prioritize_cycle_files(
             p.char_budget = max(p.char_budget, 500)
     
     # Log prioritization
-    logger.info(f"File prioritization for {len(priorities)} files:")
+    logger.info(f"File prioritization for {len(priorities)} files (strategy={strategy_hint}):")
     for p in priorities[:5]:  # Log top 5
         logger.info(f"  {p.path.split('/')[-1]}: score={p.priority_score:.1f}, budget={p.char_budget}, reasons={p.reasons}")
     

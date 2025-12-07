@@ -4,6 +4,8 @@ from agents.describer import DescriberAgent
 from agents.refactor_agent import RefactorAgent
 from agents.validator import ValidatorAgent
 from agents.explainer import ExplainerAgent
+from agents.dependency_analyzer import DependencyAnalyzerAgent
+from agents.cycle_detector import CycleDetectorAgent
 from utils.persistence import Persistor
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, UnbreakableReason
@@ -15,6 +17,8 @@ from models.schemas import (
     RefactorProposal,
     ValidationReport,
     Explanation,
+    DependencyGraph,
+    DetectedCycle,
 )
 from rag.rag_service import RAGService
 import time
@@ -36,7 +40,19 @@ class Orchestrator:
     def __init__(self, agents: List = None, config: Optional[AppConfig] = None):
         self.agents = agents or []
         self.config = config or AppConfig()
-        self.persistor = Persistor(base_dir=self.config.io.artifacts_dir)
+        
+        # Check for dry-run mode
+        self.dry_run = getattr(self.config.pipeline, "dry_run", False)
+        dry_run_log_writes = getattr(self.config.pipeline, "dry_run_log_writes", True)
+        
+        if self.dry_run:
+            logger.info("=== DRY-RUN MODE: No files will be written ===")
+        
+        self.persistor = Persistor(
+            base_dir=self.config.io.artifacts_dir,
+            dry_run=self.dry_run,
+            log_writes=dry_run_log_writes,
+        )
 
         logger.info("Initializing Orchestrator...")
 
@@ -310,6 +326,11 @@ The cycle between **{node_list}** could not be automatically broken.
         val_result = None
         validator_feedback = None
         iteration = 0
+        
+        # Accumulate failure history across all iterations
+        accumulated_failed_strategies = []
+        accumulated_reverted_files = []
+        attempt_summaries = []
 
         logger.info("-"*50)
         logger.info("STAGE 2-3: REFACTOR + VALIDATE LOOP")
@@ -330,6 +351,7 @@ The cycle between **{node_list}** could not be automatically broken.
                     rag_service=self.rag_service,
                     context_window=self.context_window,
                     max_file_chars=self.max_file_chars,
+                    refactor_config=self.config.refactor,
                 )
                 # Convert description to CycleDescription model if needed
                 description = desc_result.output
@@ -418,8 +440,52 @@ The cycle between **{node_list}** could not be automatically broken.
                     logger.info(f"\n✓ PROPOSAL APPROVED on iteration {iteration} (validated in {validator_elapsed:.1f}s)")
                     break
                 else:
-                    # Prepare feedback for next iteration
+                    # Prepare enriched feedback for next iteration
                     validator_feedback = val_result.output
+                    
+                    # Enrich feedback with retry context
+                    if validator_feedback:
+                        # Add information about reverted files from this attempt
+                        reverted_files = ref_result.output.get("reverted_files", []) if ref_result.output else []
+                        
+                        # Build attempt summary for this iteration
+                        attempt_summary = (
+                            f"Attempt {iteration}: {len(proposal.patches)} files processed"
+                        )
+                        if reverted_files:
+                            attempt_summary += f", {len(reverted_files)} reverted"
+                            reverted_paths = [rf.get('path', rf.path if hasattr(rf, 'path') else 'unknown') for rf in reverted_files[:3]]
+                            attempt_summary += f" ({', '.join(reverted_paths)})"
+                        
+                        # Accumulate failure history across all iterations
+                        attempt_summaries.append(attempt_summary)
+                        accumulated_reverted_files.extend(reverted_files)
+                        
+                        # Track what strategies failed based on issue types
+                        issue_types = set()
+                        for issue in validator_feedback.get("issues", []):
+                            if isinstance(issue, dict):
+                                issue_types.add(issue.get("issue_type", "semantic"))
+                            elif hasattr(issue, "issue_type"):
+                                issue_types.add(issue.issue_type)
+                        
+                        # Add new failed strategies (avoid duplicates)
+                        if "syntax" in issue_types:
+                            strategy = "full file output (caused syntax errors)"
+                            if strategy not in accumulated_failed_strategies:
+                                accumulated_failed_strategies.append(strategy)
+                        if "cycle" in issue_types:
+                            strategy = "refactoring approach (cycle not broken)"
+                            if strategy not in accumulated_failed_strategies:
+                                accumulated_failed_strategies.append(strategy)
+                        
+                        # Provide ACCUMULATED history to the next iteration
+                        validator_feedback["previous_reverted_files"] = accumulated_reverted_files
+                        validator_feedback["previous_attempt_summary"] = " | ".join(attempt_summaries)
+                        validator_feedback["failed_strategies"] = accumulated_failed_strategies.copy()
+                        validator_feedback["iteration"] = iteration
+                        validator_feedback["remaining_attempts"] = self.max_iterations - iteration
+                    
                     issues = validator_feedback.get("issues", []) if validator_feedback else []
                     suggestions = validator_feedback.get("suggestions", []) if validator_feedback else []
                     logger.warning(f"\n✗ PROPOSAL REJECTED on iteration {iteration}: {len(issues)} issue(s), {len(suggestions)} suggestion(s)")
@@ -549,6 +615,312 @@ The cycle between **{node_list}** could not be automatically broken.
         logger.info(f"Status: {results['status']}")
         logger.info(f"Iterations: {iteration}")
         logger.info(f"Total time: {pipeline_elapsed:.1f}s")
-        logger.info(f"Artifacts: {self.config.io.artifacts_dir}/{artifact_id}/")
+        
+        if self.dry_run:
+            logger.info("="*50)
+            logger.info("DRY-RUN SUMMARY")
+            logger.info("="*50)
+            write_log = self.persistor.get_write_log()
+            logger.info(f"Files that would be written: {len(write_log)}")
+            total_bytes = sum(w.get("size", 0) for w in write_log)
+            logger.info(f"Total data: {total_bytes:,} bytes")
+            results["dry_run_summary"] = {
+                "files_count": len(write_log),
+                "total_bytes": total_bytes,
+                "writes": write_log,
+            }
+        else:
+            logger.info(f"Artifacts: {self.config.io.artifacts_dir}/{artifact_id}/")
         
         return results
+
+    # =========================================================================
+    # Directory Analysis Mode (Optional Pre-Pipeline Step)
+    # =========================================================================
+    
+    def analyze_directory(
+        self,
+        project_dir: str,
+        extensions: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        max_cycles: int = 50,
+    ) -> Dict[str, Any]:
+        """Analyze a project directory to discover cycles.
+        
+        This is an optional pre-pipeline step that scans a TypeScript/JavaScript
+        project to automatically detect cyclic dependencies, which can then be
+        processed through the refactoring pipeline.
+        
+        Args:
+            project_dir: Path to the project root directory
+            extensions: File extensions to analyze (default: ts, tsx, js, jsx)
+            exclude_patterns: Patterns to exclude (default: node_modules, dist, etc.)
+            max_cycles: Maximum number of cycles to detect (default: 50)
+            
+        Returns:
+            Dict containing:
+                - success: Whether analysis succeeded
+                - graph: DependencyGraph of the project
+                - cycles: List of DetectedCycle objects
+                - cycle_specs: List of CycleSpec objects ready for pipeline
+                - summary: Cycle detection summary
+                
+        Example:
+            orchestrator = Orchestrator()
+            result = orchestrator.analyze_directory("/path/to/project")
+            
+            if result["success"]:
+                for spec in result["cycle_specs"]:
+                    orchestrator.run_pipeline(spec)
+        """
+        logger.info("="*50)
+        logger.info("DIRECTORY ANALYSIS MODE")
+        logger.info("="*50)
+        logger.info(f"Project: {project_dir}")
+        logger.info(f"Extensions: {extensions or ['ts', 'tsx', 'js', 'jsx']}")
+        logger.info(f"Exclude patterns: {len(exclude_patterns) if exclude_patterns else 7} patterns")
+        logger.info(f"Max cycles: {max_cycles}")
+        
+        start_time = time.time()
+        
+        # Step 1: Analyze dependencies
+        logger.info("-"*50)
+        logger.info("Step 1: Analyzing project dependencies")
+        logger.info("-"*50)
+        
+        analyzer = DependencyAnalyzerAgent()
+        analysis_result = analyzer.run({
+            "project_dir": project_dir,
+            "extensions": extensions or ["ts", "tsx", "js", "jsx"],
+            "exclude_patterns": exclude_patterns or [
+                "node_modules", "dist", "build", ".git", 
+                "__tests__", "*.test.*", "*.spec.*"
+            ],
+        })
+        
+        if analysis_result.status != "success":
+            error_msg = analysis_result.output.get("error", "unknown error")
+            logger.error(f"Dependency analysis failed: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Dependency analysis failed: {error_msg}",
+                "graph": None,
+                "cycles": [],
+                "cycle_specs": [],
+            }
+        
+        graph: DependencyGraph = analysis_result.output["graph"]
+        logger.info(f"Found {len(graph.nodes)} files, {len(graph.edges)} dependencies")
+        
+        # Log tool used and timing
+        tools = analysis_result.output.get("tools", {})
+        analysis_time = analysis_result.output.get("analysis_time_seconds", 0)
+        logger.debug(f"Analysis tools: madge={tools.get('madge_available')}, node={tools.get('node_available')}")
+        logger.debug(f"Dependency analysis took {analysis_time:.1f}s")
+        
+        # Step 2: Detect cycles
+        logger.info("-"*50)
+        logger.info("Step 2: Detecting cycles")
+        logger.info("-"*50)
+        
+        detector = CycleDetectorAgent(config={"max_cycles": max_cycles})
+        detection_result = detector.run({
+            "graph": graph,
+            "project_dir": project_dir,
+        })
+        
+        if detection_result.status != "success":
+            error_msg = detection_result.output.get("error", "unknown error")
+            logger.error(f"Cycle detection failed: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Cycle detection failed: {error_msg}",
+                "graph": graph,
+                "cycles": [],
+                "cycle_specs": [],
+            }
+        
+        cycles: List[DetectedCycle] = detection_result.output.get("cycles", [])
+        cycle_specs: List[CycleSpec] = detection_result.output.get("cycle_specs", [])
+        summary = detection_result.output.get("summary", {})
+        
+        # Log cycle spec conversion stats
+        if len(cycles) != len(cycle_specs):
+            logger.warning(f"Cycle to CycleSpec conversion: {len(cycles)} cycles -> {len(cycle_specs)} specs ({len(cycles) - len(cycle_specs)} failed)")
+        
+        elapsed = time.time() - start_time
+        
+        logger.info("="*50)
+        logger.info("ANALYSIS COMPLETE")
+        logger.info("="*50)
+        logger.info(f"Time: {elapsed:.1f}s")
+        logger.info(f"Files analyzed: {len(graph.nodes)}")
+        logger.info(f"Cycles found: {len(cycles)}")
+        if summary:
+            logger.info(f"  - Critical: {summary.get('critical', 0)}")
+            logger.info(f"  - Major: {summary.get('major', 0)}")
+            logger.info(f"  - Minor: {summary.get('minor', 0)}")
+        logger.info(f"Cycle specs ready for pipeline: {len(cycle_specs)}")
+        
+        return {
+            "success": True,
+            "graph": graph,
+            "cycles": cycles,
+            "cycle_specs": cycle_specs,
+            "summary": summary,
+            "project_info": analysis_result.output.get("project_info"),
+            "tools": analysis_result.output.get("tools"),
+            "analysis_time_seconds": elapsed,
+        }
+    
+    def run_full_analysis(
+        self,
+        project_dir: str,
+        extensions: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        max_cycles: int = 50,
+        priority: str = "severity_first",
+        prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Analyze project, detect cycles, and run refactoring pipeline on all.
+        
+        This is the complete automated workflow:
+        1. Scan project for dependencies
+        2. Detect all cycles
+        3. Prioritize cycles
+        4. Run refactoring pipeline on each cycle
+        
+        Args:
+            project_dir: Path to the project root directory
+            extensions: File extensions to analyze
+            exclude_patterns: Patterns to exclude
+            max_cycles: Maximum cycles to process
+            priority: Prioritization strategy ("severity_first", "size_first")
+            prompt: Optional prompt to pass to each pipeline run
+            
+        Returns:
+            Dict with overall results including per-cycle results
+            
+        Example:
+            orchestrator = Orchestrator()
+            results = orchestrator.run_full_analysis("/path/to/project")
+            
+            print(f"Processed {results['cycles_processed']} cycles")
+            print(f"Approved: {results['approved_count']}")
+        """
+        logger.info("="*50)
+        logger.info("FULL ANALYSIS & REFACTORING MODE")
+        logger.info("="*50)
+        
+        overall_start = time.time()
+        
+        # Step 1: Analyze directory
+        analysis = self.analyze_directory(
+            project_dir,
+            extensions=extensions,
+            exclude_patterns=exclude_patterns,
+            max_cycles=max_cycles,
+        )
+        
+        if not analysis["success"]:
+            return {
+                "success": False,
+                "error": analysis.get("error", "Analysis failed"),
+                "analysis": analysis,
+                "pipeline_results": [],
+            }
+        
+        cycle_specs = analysis["cycle_specs"]
+        
+        if not cycle_specs:
+            logger.info("No cycles found - project is cycle-free!")
+            return {
+                "success": True,
+                "cycles_found": 0,
+                "cycles_processed": 0,
+                "approved_count": 0,
+                "analysis": analysis,
+                "pipeline_results": [],
+            }
+        
+        # Step 2: Prioritize cycles
+        logger.info("-"*50)
+        logger.info("Step 2: Prioritizing cycles")
+        logger.info("-"*50)
+        logger.debug(f"Priority strategy: {priority}")
+        
+        detector = CycleDetectorAgent()
+        cycles = analysis["cycles"]
+        prioritized = detector.get_prioritized_cycles(cycles, priority)
+        
+        # Map back to specs (maintain priority order)
+        cycle_id_to_spec = {s.id: s for s in cycle_specs}
+        ordered_specs = []
+        for cycle in prioritized:
+            if cycle.id in cycle_id_to_spec:
+                ordered_specs.append(cycle_id_to_spec[cycle.id])
+        
+        logger.info(f"Prioritized {len(ordered_specs)} cycles for processing")
+        if ordered_specs:
+            top3 = ordered_specs[:3]
+            logger.debug(f"Top 3 cycles: {[s.id for s in top3]}")
+        
+        logger.info(f"\nProcessing {len(ordered_specs)} cycles (priority: {priority})")
+        
+        # Step 3: Run pipeline on each cycle
+        logger.info("-"*50)
+        logger.info("Step 3: Running refactoring pipeline")
+        logger.info("-"*50)
+        
+        pipeline_results = []
+        approved_count = 0
+        
+        for i, spec in enumerate(ordered_specs):
+            logger.info(f"\n{'='*50}")
+            logger.info(f"CYCLE {i+1}/{len(ordered_specs)}: {spec.id}")
+            logger.info(f"{'='*50}")
+            
+            try:
+                result = self.run_pipeline(spec, prompt=prompt)
+                pipeline_results.append({
+                    "cycle_id": spec.id,
+                    "status": result.get("status", "unknown"),
+                    "iterations": result.get("iterations", 0),
+                    "result": result,
+                })
+                
+                if result.get("status") == "approved":
+                    approved_count += 1
+                    logger.info(f"✓ Cycle {spec.id} APPROVED")
+                else:
+                    logger.info(f"✗ Cycle {spec.id}: {result.get('status', 'unknown')}")
+                    
+            except Exception as e:
+                logger.error(f"Pipeline failed for {spec.id}: {e}")
+                pipeline_results.append({
+                    "cycle_id": spec.id,
+                    "status": "error",
+                    "error": str(e),
+                })
+        
+        overall_elapsed = time.time() - overall_start
+        
+        logger.info("\n" + "="*50)
+        logger.info("FULL ANALYSIS COMPLETE")
+        logger.info("="*50)
+        logger.info(f"Total time: {overall_elapsed:.1f}s")
+        logger.info(f"Cycles found: {len(cycles)}")
+        logger.info(f"Cycles processed: {len(pipeline_results)}")
+        logger.info(f"Approved: {approved_count}")
+        logger.info(f"Failed: {len(pipeline_results) - approved_count}")
+        
+        return {
+            "success": True,
+            "cycles_found": len(cycles),
+            "cycles_processed": len(pipeline_results),
+            "approved_count": approved_count,
+            "failed_count": len(pipeline_results) - approved_count,
+            "analysis": analysis,
+            "pipeline_results": pipeline_results,
+            "total_time_seconds": overall_elapsed,
+        }

@@ -163,7 +163,6 @@ class ExplainerAgent(Agent):
             logger.warning(f"RAG query failed: {e}")
         
         return ""
-        self.rag_service = rag_service
 
     # -------------------------------------------------------------------------
     # Prompt building

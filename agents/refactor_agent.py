@@ -1,4 +1,5 @@
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
+from dataclasses import dataclass, field
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.snippet_selector import select_relevant_snippet
@@ -10,12 +11,61 @@ from utils.context_budget import (
     prioritize_cycle_files, get_file_budget, create_budget_for_agent,
     truncate_to_token_budget
 )
-from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport
+from utils.syntax_checker import (
+    validate_code_block, check_truncation, check_introduced_issues,
+    get_common_indent, normalize_line_endings, SyntaxIssue
+)
+from utils.compile_checker import CompileChecker, CompileResult
+from utils.patch_parser import (
+    parse_json_patches, parse_marker_patches, parse_search_replace_json,
+    infer_patches, clean_code_content, extract_patches_from_data
+)
+from utils.patch_applier import (
+    SearchReplaceResult, apply_search_replace_atomic, apply_search_replace_list_atomic,
+    apply_with_partial_rollback, try_find_search_text, extract_line_hint
+)
+from utils.diff_utils import (
+    make_unified_diff, looks_truncated, validate_patched_content,
+    check_for_truncation, get_common_indent as diff_get_common_indent
+)
+from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, RevertedFile
+from config import RefactorConfig
 import json
 import difflib
 import re
 
 logger = get_logger("refactor")
+
+
+@dataclass
+class CompileCheckInfo:
+    """Information about compile/lint check results."""
+    checked: bool = False
+    success: bool = True
+    tool_used: str = ""
+    error_count: int = 0
+    warning_count: int = 0
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PatchProcessingResult:
+    """Result of processing a single file patch."""
+    path: str
+    original: str
+    patched: str
+    diff: str
+    status: str  # "unchanged", "applied", "partial", "failed", "reverted"
+    warnings: List[str]
+    confidence: float
+    applied_blocks: int
+    total_blocks: int
+    revert_reason: str
+    pre_validated: bool
+    validation_issues: List[str]
+    has_critical_error: bool  # True if critical syntax/validation error found
+    original_patched: Optional[str]  # Content before revert (if reverted)
+    compile_info: Optional[CompileCheckInfo] = None  # Compile/lint check results
 
 
 class RefactorAgent(Agent):
@@ -89,6 +139,7 @@ After:
         max_file_chars: int = 4000,
         rag_service=None,
         context_window: int = 4096,
+        refactor_config: Optional[RefactorConfig] = None,
     ):
         self.llm = llm
         self.prompt_template = prompt_template
@@ -96,6 +147,13 @@ After:
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
         self.context_window = context_window
+        self.refactor_config = refactor_config or RefactorConfig()
+        
+        # Initialize compile checker based on config
+        self.compile_checker = CompileChecker(
+            enabled=self.refactor_config.compile_check,
+            timeout=self.refactor_config.compile_check_timeout,
+        )
 
     def _extract_strategy_from_description(self, description: CycleDescription) -> Optional[str]:
         """Extract the recommended strategy from the Describer's output."""
@@ -266,13 +324,14 @@ After:
         if feedback and feedback.issues:
             validation_issues = [{"path": i.path, "comment": i.comment} for i in feedback.issues]
         
-        # Prioritize files based on cycle structure and validation issues
+        # Prioritize files based on cycle structure, validation issues, and strategy
         files_data = [{"path": f.path, "content": f.content or ""} for f in cycle.files]
         file_priorities = prioritize_cycle_files(
             files_data,
             cycle_dict.get("graph", {}),
             validation_issues=validation_issues,
             total_char_budget=budget.get_char_budget(BudgetCategory.FILE_CONTENT),
+            strategy_hint=strategy,
         )
         
         # If we have syntax errors, boost priority of files with errors
@@ -284,7 +343,7 @@ After:
                     err_basename = err_path.split('/')[-1].split('\\')[-1]
                     if basename == err_basename:
                         fp.priority_score = 1.0  # Maximum priority
-                        fp.reason = "syntax_error_file"
+                        fp.reasons = ["syntax_error_file"]  # Replace reasons list
                         logger.debug(f"Boosted priority for syntax error file: {fp.path}")
                         break
         
@@ -458,7 +517,16 @@ public class Foo : INewInterface
         """Format validator feedback for retry prompt.
         
         Categorizes issues by type and provides focused instructions.
+        Includes enriched retry context when available.
+        Detects anti-patterns and provides specific "do not" guidance.
         """
+        # Access enriched retry context directly from model fields
+        iteration = getattr(feedback, 'iteration', 1)
+        remaining_attempts = getattr(feedback, 'remaining_attempts', 0)
+        previous_reverted = getattr(feedback, 'previous_reverted_files', [])
+        previous_summary = getattr(feedback, 'previous_attempt_summary', '')
+        failed_strategies = getattr(feedback, 'failed_strategies', [])
+        
         # Categorize issues
         syntax_issues = []
         cycle_issues = []
@@ -473,552 +541,476 @@ public class Foo : INewInterface
             else:
                 semantic_issues.append(issue)
         
-        result = "\n\n## ⚠️ Previous Attempt Failed - Address These Issues:\n"
+        # Detect anti-patterns from failure history
+        anti_patterns = self._detect_anti_patterns(
+            syntax_issues, cycle_issues, semantic_issues, 
+            previous_reverted, failed_strategies
+        )
+        
+        result = f"\n\n## ⚠️ Attempt {iteration} Failed - {remaining_attempts} attempt(s) remaining\n"
+        
+        # Show anti-patterns as prominent warnings (highest priority)
+        if anti_patterns:
+            result += "\n### 🚫 DO NOT REPEAT THESE MISTAKES:\n"
+            for ap in anti_patterns:
+                result += f"- ❌ {ap}\n"
+            result += "\n"
+        
+        # Show previous attempt summary if available
+        if previous_summary:
+            result += f"\n**Previous attempt:** {previous_summary}\n"
+        
+        # Show what was reverted (important context for LLM)
+        if previous_reverted:
+            result += "\n### 🔄 Files Reverted in Previous Attempt:\n"
+            result += "These files had errors and were reverted to original. Try a DIFFERENT approach:\n"
+            for rf in previous_reverted[:5]:
+                path = rf.get('path', rf.path if hasattr(rf, 'path') else 'unknown')
+                reason = rf.get('reason', rf.reason if hasattr(rf, 'reason') else 'unknown')
+                result += f"- **{path}**: {reason[:100]}\n"
+        
+        # Show failed strategies so LLM tries something different
+        if failed_strategies:
+            result += f"\n**Strategies already tried:** {', '.join(failed_strategies)}\n"
+            result += "Please try a DIFFERENT approach.\n"
         
         # Syntax errors first (highest priority)
         if syntax_issues:
             result += "\n### 🔴 CRITICAL - Syntax Errors (Fix First!):\n"
             result += "Your previous output had truncated or malformed code. Use SEARCH/REPLACE format for large files.\n\n"
-            for issue in syntax_issues:
+            for issue in syntax_issues[:5]:  # Limit to avoid overwhelming
                 line_info = f" (line {issue.line})" if issue.line else ""
                 result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
+            if len(syntax_issues) > 5:
+                result += f"- ... and {len(syntax_issues) - 5} more syntax issues\n"
             result += "\n**To fix:** Use targeted SEARCH/REPLACE blocks instead of outputting entire files.\n"
         
         # Cycle issues
         if cycle_issues:
             result += "\n### 🟠 Cycle Not Broken:\n"
-            for issue in cycle_issues:
+            for issue in cycle_issues[:3]:
                 result += f"- {issue.comment}\n"
+            if len(cycle_issues) > 3:
+                result += f"- ... and {len(cycle_issues) - 3} more cycle issues\n"
         
         # Other semantic issues
         if semantic_issues:
             result += "\n### 🟡 Other Issues:\n"
-            for issue in semantic_issues:
+            for issue in semantic_issues[:5]:
                 line_info = f" (line {issue.line})" if issue.line else ""
                 result += f"- **{issue.path}**{line_info}: {issue.comment}\n"
         
         if feedback.suggestions:
             result += "\n**Suggestions:**\n"
-            for suggestion in feedback.suggestions:
+            for suggestion in feedback.suggestions[:3]:
                 result += f"- {suggestion}\n"
         
-        result += "\nPlease fix these issues in your new proposal.\n"
+        result += "\nPlease fix these issues in your new proposal. Use a DIFFERENT strategy if previous attempts failed.\n"
         return result
-
-    def _parse_json_patches(self, text: str) -> List[Dict[str, str]]:
-        """Parse patches from JSON format in LLM response.
+    
+    def _detect_anti_patterns(
+        self,
+        syntax_issues: List,
+        cycle_issues: List,
+        semantic_issues: List,
+        previous_reverted: List[Dict],
+        failed_strategies: List[str]
+    ) -> List[str]:
+        """Detect anti-patterns from failure history and return specific warnings.
         
-        Handles various LLM output formats:
-        1. Clean JSON
-        2. JSON wrapped in markdown code blocks
-        3. JSON with embedded code blocks for file content
+        Analyzes the patterns in failures to provide actionable "do not" guidance.
         """
-        # Step 1: Strip markdown code block wrapper if present
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]  # Remove ```json
-        elif text.startswith("```"):
-            text = text[3:]  # Remove ```
-        if text.endswith("```"):
-            text = text[:-3]  # Remove trailing ```
-        text = text.strip()
+        anti_patterns = []
         
-        # Step 2: Try direct JSON parsing first
-        try:
-            data = json.loads(text)
-            return self._extract_patches_from_data(data)
-        except json.JSONDecodeError:
-            pass
+        # Pattern 1: Full file output causing syntax errors
+        if syntax_issues:
+            has_truncation = any(
+                "truncat" in str(getattr(i, 'comment', '')).lower() or
+                "incomplete" in str(getattr(i, 'comment', '')).lower() or
+                "unexpected EOF" in str(getattr(i, 'comment', '')) or
+                "unterminated" in str(getattr(i, 'comment', '')).lower()
+                for i in syntax_issues
+            )
+            if has_truncation:
+                anti_patterns.append(
+                    "DO NOT output full file contents - the output gets truncated. "
+                    "Use SEARCH/REPLACE blocks to make targeted changes."
+                )
         
-        # Step 3: Try to find JSON object with regex
-        json_match = re.search(r'\{[\s\S]*\}', text)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                return self._extract_patches_from_data(data)
-            except json.JSONDecodeError as e:
-                logger.debug(f"JSON parse failed: {e}")
+        # Pattern 2: Same files keep failing
+        if previous_reverted:
+            reverted_paths = {rf.get('path', '') for rf in previous_reverted if rf.get('path')}
+            current_failed_paths = {
+                getattr(i, 'path', '') 
+                for i in (syntax_issues + semantic_issues) 
+                if getattr(i, 'path', '')
+            }
+            repeated_failures = reverted_paths & current_failed_paths
+            if repeated_failures:
+                files = ', '.join(list(repeated_failures)[:3])
+                anti_patterns.append(
+                    f"DO NOT use the same approach for {files} - it failed before. "
+                    "Try a different file or a different type of change."
+                )
         
-        # Step 4: Try to extract patches with embedded code blocks
-        # LLM sometimes outputs: "patched": "```csharp\n...code...\n```"
-        # or even uses actual newlines in the JSON string
-        patches = self._parse_json_with_code_blocks(text)
-        if patches:
-            return patches
+        # Pattern 3: Cycle not broken despite changes
+        if cycle_issues and "refactoring approach (cycle not broken)" in failed_strategies:
+            anti_patterns.append(
+                "DO NOT move code without breaking the dependency. "
+                "Consider: 1) Extract an interface, 2) Use dependency injection, "
+                "3) Create a mediator/event system, 4) Move the shared code to a third module."
+            )
         
-        # Step 5: Try a more lenient extraction - find patches array directly
-        patches = self._extract_patches_lenient(text)
-        if patches:
-            return patches
+        # Pattern 4: Multiple syntax errors suggests wrong output format
+        if len(syntax_issues) >= 3:
+            anti_patterns.append(
+                "DO NOT output file contents directly - always use the SEARCH/REPLACE format: "
+                "<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE"
+            )
         
-        logger.debug("All JSON parsing strategies failed")
-        return []
+        # Pattern 5: Same edge keeps appearing in cycle issues
+        cycle_edges = []
+        for issue in cycle_issues:
+            comment = str(getattr(issue, 'comment', ''))
+            # Try to extract edge info like "A -> B still exists"
+            if "->" in comment:
+                cycle_edges.append(comment)
+        if len(cycle_edges) >= 2:
+            anti_patterns.append(
+                "The same dependency edge keeps appearing. "
+                "Focus on REMOVING or INVERTING this specific dependency, "
+                "not just moving code around."
+            )
+        
+        return anti_patterns
+    
+    # -------------------------------------------------------------------------
+    # Patch Parsing Methods (delegated to utils.patch_parser)
+    # -------------------------------------------------------------------------
+    
+    def _parse_json_patches(self, text: str) -> List[Dict[str, str]]:
+        """Parse patches from JSON format. Delegates to utils.patch_parser."""
+        return parse_json_patches(text)
     
     def _extract_patches_from_data(self, data: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Extract patches from parsed JSON data."""
-        patches = []
-        raw_patches = data.get("patches", [])
-        
-        if not raw_patches:
-            logger.debug("JSON parsed but no 'patches' array found")
-            return []
-        
-        for p in raw_patches:
-            path = p.get("path")
-            patched = p.get("patched")
-            
-            if not path:
-                logger.warning("Patch missing 'path' field")
-                continue
-            if not patched:
-                logger.warning(f"Patch for {path} missing 'patched' content")
-                continue
-            
-            # Clean up the patched content (remove code block markers if present)
-            patched = self._clean_code_content(patched)
-                
-            patches.append({
-                "path": path,
-                "patched": patched
-            })
-        
-        return patches
+        """Extract patches from parsed JSON data. Delegates to utils.patch_parser."""
+        return extract_patches_from_data(data)
     
     def _clean_code_content(self, content: str) -> str:
-        """Remove code block markers from content."""
-        content = content.strip()
-        # Remove leading code block marker with optional language
-        if content.startswith("```"):
-            first_newline = content.find("\n")
-            if first_newline != -1:
-                content = content[first_newline + 1:]
-            else:
-                content = content[3:]
-        # Remove trailing code block marker
-        if content.endswith("```"):
-            content = content[:-3]
-        return content.strip()
+        """Remove code block markers. Delegates to utils.patch_parser."""
+        return clean_code_content(content)
     
-    def _parse_json_with_code_blocks(self, text: str) -> List[Dict[str, str]]:
-        """Parse JSON where patched content might have embedded code blocks.
-        
-        Some LLMs output:
-        {
-          "patches": [
-            {
-              "path": "file.cs",
-              "patched": "```csharp
-              ...actual code...
-              ```"
-            }
-          ]
-        }
-        """
-        patches = []
-        
-        # Find all path/patched pairs using a more flexible pattern
-        # Look for "path": "..." followed eventually by "patched": "..."
-        path_pattern = r'"path"\s*:\s*"([^"]+)"'
-        
-        # Find all paths first
-        path_matches = list(re.finditer(path_pattern, text))
-        
-        for i, path_match in enumerate(path_matches):
-            path = path_match.group(1)
-            
-            # Find the "patched" field after this path
-            start_search = path_match.end()
-            end_search = path_matches[i + 1].start() if i + 1 < len(path_matches) else len(text)
-            
-            section = text[start_search:end_search]
-            
-            # Look for patched content - might be a code block
-            patched_match = re.search(r'"patched"\s*:\s*"', section)
-            if patched_match:
-                # Find where the value starts
-                value_start = patched_match.end()
-                # Now find the end - this is tricky because the content might have quotes
-                # Look for the pattern that ends the JSON string
-                # Could end with ", or "} or "] 
-                content_section = section[value_start:]
-                
-                # Try to find the end by looking for unescaped quote followed by comma/bracket
-                patched_content = self._extract_json_string_value(content_section)
-                if patched_content:
-                    patched_content = self._clean_code_content(patched_content)
-                    patches.append({"path": path, "patched": patched_content})
-        
-        return patches
-    
-    def _extract_json_string_value(self, text: str) -> Optional[str]:
-        """Extract a JSON string value, handling escaped characters."""
-        result = []
-        i = 0
-        while i < len(text):
-            char = text[i]
-            if char == '\\' and i + 1 < len(text):
-                # Escaped character
-                next_char = text[i + 1]
-                if next_char == 'n':
-                    result.append('\n')
-                elif next_char == 't':
-                    result.append('\t')
-                elif next_char == 'r':
-                    result.append('\r')
-                elif next_char == '"':
-                    result.append('"')
-                elif next_char == '\\':
-                    result.append('\\')
-                else:
-                    result.append(next_char)
-                i += 2
-            elif char == '"':
-                # End of string
-                return ''.join(result)
-            else:
-                result.append(char)
-                i += 1
-        
-        # Didn't find closing quote - return what we have
-        return ''.join(result) if result else None
-    
-    def _extract_patches_lenient(self, text: str) -> List[Dict[str, str]]:
-        """Lenient extraction when JSON parsing fails.
-        
-        Looks for file paths and code content directly.
-        """
-        patches = []
-        
-        # Pattern: "path": "/some/path/file.cs" followed by code
-        # Then look for code blocks or "patched": content
-        
-        # Find patterns like: "path": "...", "patched": <content>
-        # where content might be malformed JSON but contains the code
-        
-        path_matches = re.findall(r'"path"\s*:\s*"([^"]+)"', text)
-        
-        for path in path_matches:
-            # Try to find associated code block after the path mention
-            path_pos = text.find(f'"path": "{path}"') 
-            if path_pos == -1:
-                path_pos = text.find(f'"path":"{path}"')
-            if path_pos == -1:
-                continue
-            
-            # Look for code block after this path
-            remaining = text[path_pos:]
-            
-            # Look for code block markers
-            code_block_match = re.search(r'```(?:csharp|cs|python|java|javascript|typescript)?\n([\s\S]*?)```', remaining)
-            if code_block_match:
-                patches.append({
-                    "path": path,
-                    "patched": code_block_match.group(1).strip()
-                })
-        
-        return patches
-
     def _parse_marker_patches(self, text: str) -> List[Dict[str, str]]:
-        """Parse file marker format, handling both full content and SEARCH/REPLACE blocks."""
-        pattern = r"--- FILE: (.+?) ---\n"
-        parts = re.split(pattern, text)
-        patches = []
-        if len(parts) < 3:
-            return patches
-        
-        # drop leading preamble
-        it = iter(parts[1:])
-        for path, content in zip(it, it):
-            path = path.strip()
-            content = content.strip()
-            
-            # Check if content contains SEARCH/REPLACE blocks
-            if "<<<<<<< SEARCH" in content and ">>>>>>> REPLACE" in content:
-                patches.append({
-                    "path": path,
-                    "search_replace_blocks": content,  # Will be processed later
-                    "patched": None  # Indicates we need to apply search/replace
-                })
-            else:
-                patches.append({"path": path, "patched": content})
-        
-        return patches
-
+        """Parse file marker format. Delegates to utils.patch_parser."""
+        return parse_marker_patches(text)
+    
     def _parse_search_replace_json(self, text: str) -> List[Dict[str, Any]]:
-        """Parse JSON format with search_replace changes instead of full patches."""
-        try:
-            # Strip markdown wrapper
-            text = text.strip()
-            if text.startswith("```"):
-                first_newline = text.find("\n")
-                text = text[first_newline + 1:] if first_newline != -1 else text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            
-            # Try to parse JSON
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if not json_match:
-                return []
-            
-            data = json.loads(json_match.group())
-            changes = data.get("changes", [])
-            
-            if not changes:
-                return []
-            
-            result = []
-            for change in changes:
-                path = change.get("path")
-                search_replace = change.get("search_replace", [])
-                if path and search_replace:
-                    result.append({
-                        "path": path,
-                        "search_replace": search_replace
-                    })
-            
-            return result
-        except Exception as e:
-            logger.debug(f"Failed to parse search_replace JSON: {e}")
-            return []
-
-    def _apply_search_replace(self, original: str, search_replace_blocks: str) -> str:
-        """Apply SEARCH/REPLACE blocks to original content.
-        
-        Format:
-        <<<<<<< SEARCH
-        old text
-        =======
-        new text
-        >>>>>>> REPLACE
-        """
-        result = original
-        
-        # Normalize line endings for consistent matching
-        result = result.replace('\r\n', '\n')
-        search_replace_blocks = search_replace_blocks.replace('\r\n', '\n')
-        
-        # Parse SEARCH/REPLACE blocks
-        pattern = r'<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE'
-        matches = re.findall(pattern, search_replace_blocks)
-        
-        if not matches:
-            logger.warning("No SEARCH/REPLACE blocks found in content")
-            return original
-        
-        applied_count = 0
-        for search_text, replace_text in matches:
-            # Strategy 1: Exact match
-            if search_text in result:
-                result = result.replace(search_text, replace_text, 1)
-                applied_count += 1
-                logger.debug(f"Applied exact search/replace: {len(search_text)} chars -> {len(replace_text)} chars")
-                continue
-            
-            # Strategy 2: Strip trailing whitespace from each line and try again
-            search_lines = [line.rstrip() for line in search_text.split('\n')]
-            result_lines = result.split('\n')
-            result_lines_stripped = [line.rstrip() for line in result_lines]
-            
-            # Find the starting line
-            found = False
-            for i in range(len(result_lines_stripped) - len(search_lines) + 1):
-                if result_lines_stripped[i:i + len(search_lines)] == search_lines:
-                    # Found match - replace these lines
-                    new_lines = result_lines[:i] + replace_text.split('\n') + result_lines[i + len(search_lines):]
-                    result = '\n'.join(new_lines)
-                    applied_count += 1
-                    found = True
-                    logger.debug(f"Applied whitespace-normalized search/replace at line {i}")
-                    break
-            
-            if found:
-                continue
-            
-            # Strategy 3: Anchor-based matching (first and last non-empty lines)
-            non_empty_search = [l.strip() for l in search_lines if l.strip()]
-            if len(non_empty_search) >= 2:
-                first_anchor = non_empty_search[0]
-                last_anchor = non_empty_search[-1]
-                
-                start_idx = None
-                end_idx = None
-                
-                for i, line in enumerate(result_lines):
-                    stripped = line.strip()
-                    if stripped == first_anchor and start_idx is None:
-                        start_idx = i
-                    elif start_idx is not None and stripped == last_anchor:
-                        end_idx = i
-                        break
-                
-                if start_idx is not None and end_idx is not None and end_idx > start_idx:
-                    new_lines = result_lines[:start_idx] + replace_text.split('\n') + result_lines[end_idx + 1:]
-                    result = '\n'.join(new_lines)
-                    applied_count += 1
-                    logger.debug(f"Applied anchor-based search/replace at lines {start_idx}-{end_idx}")
-                    continue
-            
-            logger.warning(f"Search text not found in file: {search_text[:100]}...")
-        
-        logger.info(f"Applied {applied_count}/{len(matches)} search/replace blocks")
-        return result
-
-    def _apply_search_replace_list(self, original: str, search_replace_list: List[Dict[str, str]]) -> str:
-        """Apply a list of search/replace operations from JSON format."""
-        result = original.replace('\r\n', '\n')  # Normalize line endings
-        applied_count = 0
-        
-        for sr in search_replace_list:
-            search_text = sr.get("search", "").replace('\r\n', '\n')
-            replace_text = sr.get("replace", "").replace('\r\n', '\n')
-            
-            if not search_text:
-                continue
-            
-            # Strategy 1: Exact match
-            if search_text in result:
-                result = result.replace(search_text, replace_text, 1)
-                applied_count += 1
-                logger.debug(f"Applied exact search/replace: {len(search_text)} chars -> {len(replace_text)} chars")
-                continue
-            
-            # Strategy 2: Line-by-line with stripped whitespace
-            search_lines = [line.rstrip() for line in search_text.split('\n')]
-            result_lines = result.split('\n')
-            result_lines_stripped = [line.rstrip() for line in result_lines]
-            
-            found = False
-            for i in range(len(result_lines_stripped) - len(search_lines) + 1):
-                if result_lines_stripped[i:i + len(search_lines)] == search_lines:
-                    new_lines = result_lines[:i] + replace_text.split('\n') + result_lines[i + len(search_lines):]
-                    result = '\n'.join(new_lines)
-                    applied_count += 1
-                    found = True
-                    logger.debug(f"Applied whitespace-normalized search/replace at line {i}")
-                    break
-            
-            if found:
-                continue
-            
-            # Strategy 3: Anchor-based (first and last non-empty lines)
-            non_empty_search = [l.strip() for l in search_lines if l.strip()]
-            if len(non_empty_search) >= 2:
-                first_anchor = non_empty_search[0]
-                last_anchor = non_empty_search[-1]
-                
-                start_idx = None
-                end_idx = None
-                
-                for i, line in enumerate(result_lines):
-                    stripped = line.strip()
-                    if stripped == first_anchor and start_idx is None:
-                        start_idx = i
-                    elif start_idx is not None and stripped == last_anchor:
-                        end_idx = i
-                        break
-                
-                if start_idx is not None and end_idx is not None and end_idx > start_idx:
-                    new_lines = result_lines[:start_idx] + replace_text.split('\n') + result_lines[end_idx + 1:]
-                    result = '\n'.join(new_lines)
-                    applied_count += 1
-                    logger.debug(f"Applied anchor-based search/replace at lines {start_idx}-{end_idx}")
-                    continue
-            
-            logger.warning(f"Search text not found: {search_text[:80]}...")
-        
-        logger.info(f"Applied {applied_count}/{len(search_replace_list)} search/replace operations")
-        return result
+        """Parse JSON format with search_replace changes. Delegates to utils.patch_parser."""
+        return parse_search_replace_json(text)
+    
+    # -------------------------------------------------------------------------
+    # Patch Application Methods (delegated to utils.patch_applier)
+    # -------------------------------------------------------------------------
+    
+    def _extract_line_hint(self, text: str) -> Optional[int]:
+        """Extract line number hint from text. Delegates to utils.patch_applier."""
+        return extract_line_hint(text)
+    
+    def _try_find_search_text(
+        self, 
+        search_text: str, 
+        content_lines: List[str],
+        content_lines_stripped: List[str],
+        line_hint: Optional[int] = None
+    ) -> Tuple[Optional[int], Optional[int], str, float]:
+        """Try to find search text in content. Delegates to utils.patch_applier."""
+        result = try_find_search_text(search_text, content_lines, content_lines_stripped, line_hint)
+        return result.start, result.end, result.strategy, result.confidence
+    
+    def _apply_search_replace_atomic(
+        self, 
+        original: str, 
+        search_replace_blocks: str,
+        min_confidence: Optional[float] = None
+    ) -> SearchReplaceResult:
+        """Apply SEARCH/REPLACE blocks atomically. Delegates to utils.patch_applier."""
+        if min_confidence is None:
+            min_confidence = self.refactor_config.min_match_confidence
+        return apply_search_replace_atomic(
+            original, 
+            search_replace_blocks,
+            min_confidence=min_confidence,
+            warn_confidence=self.refactor_config.warn_confidence,
+            allow_low_confidence=self.refactor_config.allow_low_confidence
+        )
+    
+    def _apply_search_replace_list_atomic(
+        self, 
+        original: str, 
+        search_replace_list: List[Dict[str, str]],
+        min_confidence: Optional[float] = None
+    ) -> SearchReplaceResult:
+        """Apply a list of search/replace operations atomically. Delegates to utils.patch_applier."""
+        if min_confidence is None:
+            min_confidence = self.refactor_config.min_match_confidence
+        return apply_search_replace_list_atomic(
+            original, 
+            search_replace_list,
+            min_confidence=min_confidence,
+            warn_confidence=self.refactor_config.warn_confidence,
+            allow_low_confidence=self.refactor_config.allow_low_confidence
+        )
+    
+    def _apply_with_partial_rollback(
+        self,
+        original: str,
+        search_replace_blocks: str,
+        path: str,
+        original_content: str = None
+    ) -> SearchReplaceResult:
+        """Apply with partial rollback on failure. Delegates to utils.patch_applier."""
+        return apply_with_partial_rollback(
+            original,
+            search_replace_blocks,
+            path,
+            original_content,
+            min_confidence=self.refactor_config.min_match_confidence,
+            warn_confidence=self.refactor_config.warn_confidence,
+            allow_low_confidence=self.refactor_config.allow_low_confidence
+        )
+    
+    def _apply_search_replace(self, original: str, search_replace_blocks: str) -> Tuple[str, List[str]]:
+        """Apply SEARCH/REPLACE blocks (simple interface). Delegates to utils.patch_applier."""
+        result = self._apply_search_replace_atomic(original, search_replace_blocks)
+        return result.content, result.warnings
+    
+    def _apply_search_replace_list(self, original: str, search_replace_list: List[Dict[str, str]]) -> Tuple[str, List[str]]:
+        """Apply a list of search/replace operations (simple interface). Delegates to utils.patch_applier."""
+        result = self._apply_search_replace_list_atomic(original, search_replace_list)
+        return result.content, result.warnings
+    
+    # -------------------------------------------------------------------------
+    # Diff and Validation Methods (delegated to utils.diff_utils)
+    # -------------------------------------------------------------------------
+    
+    def _looks_truncated(self, text: str) -> bool:
+        """Check if text appears truncated. Delegates to utils.diff_utils."""
+        return looks_truncated(text)
+    
+    def _get_common_indent(self, lines: List[str]) -> str:
+        """Get common leading whitespace. Delegates to utils.diff_utils."""
+        return diff_get_common_indent(lines)
+    
+    def _validate_patched_content(self, original: str, patched: str, path: str) -> List[str]:
+        """Validate patched content. Delegates to utils.diff_utils."""
+        return validate_patched_content(original, patched, path)
 
     def _infer_patches(self, llm_response: Any, cycle_files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Parse patches from LLM response using multiple strategies.
         
-        Returns list of dicts with either:
-        - {"path": str, "patched": str} for full content patches
-        - {"path": str, "search_replace_blocks": str} for marker-style S/R
-        - {"path": str, "search_replace": List[Dict]} for JSON-style S/R
+        Delegates to utils.patch_parser.infer_patches.
         """
-        text = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
-
-        # Try structured JSON first (handles both full patches and search_replace format)
-        patches = self._parse_json_patches(text)
-        if patches:
-            logger.debug(f"Parsed {len(patches)} patches from JSON format")
-            return patches
-
-        # Try JSON with search_replace changes
-        patches = self._parse_search_replace_json(text)
-        if patches:
-            logger.debug(f"Parsed {len(patches)} search/replace patches from JSON format")
-            return patches
-
-        # Try marker format (handles both full content and SEARCH/REPLACE blocks)
-        patches = self._parse_marker_patches(text)
-        if patches:
-            logger.debug(f"Parsed {len(patches)} patches from marker format")
-            return patches
-
-        # Log the first part of response to help debug parsing issues
-        logger.warning(f"Could not parse patches from LLM response. First 500 chars: {text[:500]}")
-        
-        # Nothing parsed: return empty => no-op
-        return []
+        return infer_patches(llm_response, cycle_files)
 
     def _make_unified_diff(self, original: str, patched: str, path: str) -> str:
-        orig_lines = original.splitlines(keepends=True)
-        patched_lines = patched.splitlines(keepends=True)
-        diff = difflib.unified_diff(orig_lines, patched_lines, fromfile=f"a/{path}", tofile=f"b/{path}")
-        return "".join(diff)
+        """Generate a unified diff. Delegates to utils.diff_utils."""
+        return make_unified_diff(original, patched, path)
 
     def _check_for_truncation(self, content: str, path: str) -> bool:
-        """Check if content appears to be truncated (unbalanced brackets).
+        """Check if content appears to be truncated. Delegates to utils.diff_utils."""
+        return check_for_truncation(content, path)
+
+    def _process_single_file_patch(
+        self,
+        path: str,
+        original: str,
+        inferred: List[Dict[str, Any]],
+    ) -> PatchProcessingResult:
+        """Process a single file's patch and return the result.
         
-        Returns True if truncation is detected.
+        This method handles:
+        - Finding the matching patch from inferred list
+        - Applying SEARCH/REPLACE operations
+        - Pre-validating patched content for critical errors
+        
+        Args:
+            path: File path being patched
+            original: Original file content
+            inferred: List of inferred patches from LLM
+            
+        Returns:
+            PatchProcessingResult with all patch details
         """
-        if not content:
-            return False
+        # Try multiple matching strategies to find the patch
+        patched_entry = None
+        basename = path.split("/")[-1]
         
-        # Count brackets
-        open_braces = content.count('{')
-        close_braces = content.count('}')
-        open_parens = content.count('(')
-        close_parens = content.count(')')
-        open_brackets = content.count('[')
-        close_brackets = content.count(']')
+        # 1. Exact path match
+        patched_entry = next((p for p in inferred if p.get("path") == path), None)
         
-        # Check for significant imbalance
-        brace_diff = open_braces - close_braces
-        paren_diff = open_parens - close_parens
-        bracket_diff = open_brackets - close_brackets
+        if patched_entry is None:
+            # 2. Basename match
+            patched_entry = next((p for p in inferred if p.get("path", "").endswith(basename)), None)
         
-        if abs(brace_diff) > 1:
-            logger.warning(f"Possible truncation in {path}: unbalanced braces {{}} ({open_braces} open, {close_braces} close)")
-            return True
-        if abs(paren_diff) > 2:  # Allow more leeway for parentheses
-            logger.warning(f"Possible truncation in {path}: unbalanced parentheses () ({open_parens} open, {close_parens} close)")
-            return True
-        if abs(bracket_diff) > 1:
-            logger.warning(f"Possible truncation in {path}: unbalanced brackets [] ({open_brackets} open, {close_brackets} close)")
-            return True
+        if patched_entry is None:
+            # 3. Partial path match
+            for p in inferred:
+                inferred_path = p.get("path", "")
+                if inferred_path and (path.endswith(inferred_path) or inferred_path.endswith(basename)):
+                    patched_entry = p
+                    break
         
-        # Check if file ends abruptly (common truncation patterns)
-        content_stripped = content.rstrip()
-        truncation_indicators = [
-            # Incomplete statements
-            content_stripped.endswith(','),
-            content_stripped.endswith('('),
-            content_stripped.endswith('{'),
-            content_stripped.endswith('['),
-            content_stripped.endswith(':'),
-            # Incomplete strings
-            content_stripped.count('"') % 2 != 0,
-            content_stripped.count("'") % 2 != 0,
-        ]
+        if patched_entry is None:
+            # 4. Case-insensitive basename match
+            basename_lower = basename.lower()
+            patched_entry = next(
+                (p for p in inferred if p.get("path", "").lower().endswith(basename_lower)), 
+                None
+            )
         
-        if any(truncation_indicators):
-            logger.warning(f"Possible truncation in {path}: file ends with incomplete construct")
-            return True
+        if patched_entry is None:
+            logger.warning(f"No patch found for {path} (basename: {basename})")
         
-        return False
+        # Initialize tracking variables
+        patch_status = "unchanged"
+        patch_warnings: List[str] = []
+        patch_confidence = 1.0
+        applied_blocks = 0
+        total_blocks = 0
+        revert_reason = ""
+        has_critical_error = False
+        original_patched = None
+        patched = original
+        
+        # Determine patched content
+        if patched_entry:
+            if patched_entry.get("patched"):
+                # Full patched content provided
+                patched = patched_entry.get("patched")
+                patch_status = "applied"
+            elif patched_entry.get("search_replace_blocks"):
+                # Marker-style SEARCH/REPLACE blocks
+                sr_result = self._apply_with_partial_rollback(
+                    original, 
+                    patched_entry.get("search_replace_blocks"),
+                    path,
+                    original
+                )
+                patched = sr_result.content
+                patch_warnings = sr_result.warnings
+                patch_confidence = sr_result.confidence
+                applied_blocks = sr_result.applied_count
+                total_blocks = sr_result.total_count
+                
+                if sr_result.applied_count == 0:
+                    patch_status = "failed"
+                    revert_reason = "No SEARCH/REPLACE blocks could be applied"
+                    has_critical_error = True
+                elif not sr_result.is_atomic:
+                    patch_status = "partial"
+                else:
+                    patch_status = "applied"
+                
+                logger.debug(f"Applied marker-style search/replace to {path}: {applied_blocks}/{total_blocks}")
+            elif patched_entry.get("search_replace"):
+                # JSON-style search_replace list
+                sr_result = self._apply_search_replace_list_atomic(
+                    original, patched_entry.get("search_replace")
+                )
+                patched = sr_result.content
+                patch_warnings = sr_result.warnings
+                patch_confidence = sr_result.confidence
+                applied_blocks = sr_result.applied_count
+                total_blocks = sr_result.total_count
+                
+                if sr_result.applied_count == 0:
+                    patch_status = "failed"
+                    revert_reason = "No search/replace operations could be applied"
+                    has_critical_error = True
+                else:
+                    patch_status = "applied"
+                
+                logger.debug(f"Applied JSON-style search/replace to {path}: {applied_blocks}/{total_blocks}")
+        
+        # Log warnings
+        for warning in patch_warnings:
+            logger.warning(f"S/R Warning [{path}]: {warning}")
+        
+        # Pre-validate patched content
+        pre_validated = False
+        validation_issues: List[str] = []
+        
+        if patched != original:
+            validation_result = validate_code_block(patched, path, original)
+            pre_validated = True
+            validation_issues = [i.message for i in validation_result.issues]
+            
+            for issue in validation_result.issues:
+                if issue.severity == "critical":
+                    logger.error(f"Patch Validation [{path}]: {issue.message}")
+                else:
+                    logger.warning(f"Patch Validation [{path}]: {issue.message}")
+            
+            # Check for critical issues
+            if validation_result.has_critical:
+                has_critical_error = True
+                revert_reason = "; ".join(i.message for i in validation_result.issues if i.severity == "critical")
+                original_patched = patched  # Save what we tried
+        
+        # Compile/lint check (if enabled and no critical errors yet)
+        compile_info = CompileCheckInfo()
+        
+        if patched != original and self.refactor_config.compile_check and not has_critical_error:
+            compile_result = self.compile_checker.check_file(path, patched)
+            compile_info = CompileCheckInfo(
+                checked=True,
+                success=compile_result.success,
+                tool_used=compile_result.tool_used,
+                error_count=compile_result.error_count,
+                warning_count=compile_result.warning_count,
+                errors=[str(e) for e in compile_result.errors],
+            )
+            
+            if compile_result.tool_available:
+                logger.info(f"Compile check [{path}]: {compile_result.summary()}")
+                
+                if not compile_result.success:
+                    for error in compile_result.errors:
+                        logger.error(f"Compile Error [{path}]: {error}")
+                        validation_issues.append(f"Compile: {error}")
+                    
+                    # Mark as critical if configured to revert on compile errors
+                    if self.refactor_config.revert_on_compile_error:
+                        has_critical_error = True
+                        revert_reason = f"Compile check failed: {compile_result.error_count} errors"
+                        original_patched = patched
+                
+                for warning in compile_result.warnings[:5]:  # Limit warnings
+                    logger.warning(f"Compile Warning [{path}]: {warning}")
+                    patch_warnings.append(f"Compile: {warning}")
+            else:
+                logger.debug(f"Compile check skipped for {path}: {compile_result.tool_used} not available")
+        
+        # Generate diff
+        diff = self._make_unified_diff(original, patched, path) if patched != original else ""
+        
+        return PatchProcessingResult(
+            path=path,
+            original=original,
+            patched=patched,
+            diff=diff,
+            status=patch_status,
+            warnings=patch_warnings,
+            confidence=patch_confidence,
+            applied_blocks=applied_blocks,
+            total_blocks=total_blocks,
+            revert_reason=revert_reason,
+            pre_validated=pre_validated,
+            validation_issues=validation_issues,
+            has_critical_error=has_critical_error,
+            original_patched=original_patched,
+            compile_info=compile_info,
+        )
 
     def run(
         self,
@@ -1099,9 +1091,6 @@ public class Foo : INewInterface
                 pass
 
             # Build final patches list merging originals with patched content
-            patches_out = []
-            files_changed = 0
-            
             # Log what patches were inferred for debugging
             if inferred:
                 inferred_paths = [p.get("path", "unknown") for p in inferred]
@@ -1109,78 +1098,118 @@ public class Foo : INewInterface
             else:
                 logger.warning("No patches inferred from LLM response - check if LLM returned valid output")
             
+            # Phase 1: Process all files and collect results (without committing)
+            processing_results: List[PatchProcessingResult] = []
+            
             for f in cycle_spec.files:
-                path = f.path
-                original = f.content or ""
-                
-                # Try multiple matching strategies
-                patched_entry = None
-                
-                # 1. Exact path match
-                patched_entry = next((p for p in inferred if p.get("path") == path), None)
-                
-                if patched_entry is None:
-                    # 2. Basename match (just the filename)
-                    basename = path.split("/")[-1]
-                    patched_entry = next((p for p in inferred if p.get("path", "").endswith(basename)), None)
-                
-                if patched_entry is None:
-                    # 3. Partial path match (e.g., "Stores/ISensorStore.cs" matches "/full/path/Stores/ISensorStore.cs")
-                    for p in inferred:
-                        inferred_path = p.get("path", "")
-                        if inferred_path and (path.endswith(inferred_path) or inferred_path.endswith(basename)):
-                            patched_entry = p
-                            break
-                
-                if patched_entry is None:
-                    # 4. Case-insensitive basename match (for Windows paths vs Linux paths)
-                    basename_lower = basename.lower()
-                    patched_entry = next(
-                        (p for p in inferred if p.get("path", "").lower().endswith(basename_lower)), 
-                        None
-                    )
-                
-                if patched_entry is None:
-                    logger.warning(f"No patch found for {path} (basename: {basename})")
-
-                # Determine patched content - handle both full patches and search/replace
-                if patched_entry:
-                    if patched_entry.get("patched"):
-                        # Full patched content provided
-                        patched = patched_entry.get("patched")
-                    elif patched_entry.get("search_replace_blocks"):
-                        # Marker-style SEARCH/REPLACE blocks
-                        patched = self._apply_search_replace(
-                            original, patched_entry.get("search_replace_blocks")
-                        )
-                        logger.debug(f"Applied marker-style search/replace to {path}")
-                    elif patched_entry.get("search_replace"):
-                        # JSON-style search_replace list
-                        patched = self._apply_search_replace_list(
-                            original, patched_entry.get("search_replace")
-                        )
-                        logger.debug(f"Applied JSON-style search/replace to {path}")
-                    else:
-                        # Entry exists but no content - keep original
-                        patched = original
+                result = self._process_single_file_patch(
+                    path=f.path,
+                    original=f.content or "",
+                    inferred=inferred,
+                )
+                processing_results.append(result)
+            
+            # Phase 2: Check if atomic proposal mode should revert everything
+            atomic_proposal = self.refactor_config.atomic_proposal
+            revert_on_critical = self.refactor_config.revert_on_any_critical
+            
+            has_any_critical = any(r.has_critical_error for r in processing_results)
+            has_any_failed = any(r.status == "failed" for r in processing_results)
+            
+            revert_all = False
+            revert_all_reason = ""
+            
+            if atomic_proposal:
+                if has_any_critical and revert_on_critical:
+                    critical_files = [r.path for r in processing_results if r.has_critical_error]
+                    revert_all = True
+                    revert_all_reason = f"Atomic proposal mode: critical errors in {critical_files}"
+                    logger.error(f"Atomic proposal: reverting all {len(processing_results)} files due to critical errors in: {critical_files}")
+                elif has_any_failed:
+                    failed_files = [r.path for r in processing_results if r.status == "failed"]
+                    revert_all = True
+                    revert_all_reason = f"Atomic proposal mode: patch application failed in {failed_files}"
+                    logger.error(f"Atomic proposal: reverting all {len(processing_results)} files due to failures in: {failed_files}")
+            
+            # Phase 3: Build final patches list
+            patches_out = []
+            reverted_files = []
+            files_changed = 0
+            
+            for result in processing_results:
+                if revert_all:
+                    # Revert everything - use original content
+                    if result.patched != result.original:
+                        reverted_files.append(RevertedFile(
+                            path=result.path,
+                            reason=revert_all_reason,
+                            warnings=result.warnings,
+                            original_patched=result.patched[:2000] if result.patched else None,
+                        ))
+                    
+                    patches_out.append(Patch(
+                        path=result.path,
+                        original=result.original,
+                        patched=result.original,  # Reverted to original
+                        diff="",
+                        status="reverted" if result.patched != result.original else "unchanged",
+                        warnings=result.warnings + [revert_all_reason] if result.warnings else [revert_all_reason],
+                        confidence=result.confidence,
+                        applied_blocks=0,
+                        total_blocks=result.total_blocks,
+                        revert_reason=revert_all_reason if result.patched != result.original else "",
+                        pre_validated=result.pre_validated,
+                        validation_issues=result.validation_issues,
+                    ))
+                elif result.has_critical_error:
+                    # Individual file revert (non-atomic mode)
+                    logger.error(f"Reverting {result.path} due to critical errors")
+                    reverted_files.append(RevertedFile(
+                        path=result.path,
+                        reason=result.revert_reason,
+                        warnings=result.warnings,
+                        original_patched=result.original_patched[:2000] if result.original_patched else None,
+                    ))
+                    
+                    patches_out.append(Patch(
+                        path=result.path,
+                        original=result.original,
+                        patched=result.original,  # Reverted
+                        diff="",
+                        status="reverted",
+                        warnings=result.warnings,
+                        confidence=result.confidence,
+                        applied_blocks=0,
+                        total_blocks=result.total_blocks,
+                        revert_reason=result.revert_reason,
+                        pre_validated=result.pre_validated,
+                        validation_issues=result.validation_issues,
+                    ))
                 else:
-                    patched = original
+                    # Normal case - apply the patch
+                    if result.diff:
+                        files_changed += 1
+                        logger.debug(f"File changed: {result.path} ({len(result.diff)} chars diff)")
+                    
+                    patches_out.append(Patch(
+                        path=result.path,
+                        original=result.original,
+                        patched=result.patched,
+                        diff=result.diff,
+                        status=result.status,
+                        warnings=result.warnings,
+                        confidence=result.confidence,
+                        applied_blocks=result.applied_blocks,
+                        total_blocks=result.total_blocks,
+                        revert_reason=result.revert_reason,
+                        pre_validated=result.pre_validated,
+                        validation_issues=result.validation_issues,
+                    ))
 
-                # Check for truncation - if detected, revert to original
-                if patched != original and self._check_for_truncation(patched, path):
-                    logger.warning(f"Truncation detected in {path}, reverting to original")
-                    patched = original
-
-                diff = self._make_unified_diff(original, patched, path) if patched != original else ""
-                if diff:
-                    files_changed += 1
-                    logger.debug(f"File changed: {path} ({len(diff)} chars diff)")
-
-                patches_out.append(Patch(path=path, original=original, patched=patched, diff=diff))
-
-            logger.info(f"RefactorAgent completed: {files_changed}/{len(patches_out)} files changed")
+            logger.info(f"RefactorAgent completed: {files_changed}/{len(patches_out)} files changed, {len(reverted_files)} reverted (atomic={atomic_proposal})")
             proposal = RefactorProposal(
                 patches=patches_out,
+                reverted_files=reverted_files,
                 rationale=f"LLM proposal using strategy: {strategy or 'auto-selected'}",
                 llm_response=llm_response if isinstance(llm_response, str) else json.dumps(llm_response),
             )

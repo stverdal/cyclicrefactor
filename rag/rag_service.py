@@ -264,10 +264,11 @@ def get_rag_service(config: Optional[RetrieverConfig] = None) -> RAGService:
     """
     Get the RAG service instance.
     
-    Uses a singleton pattern for efficiency.
+    Uses a singleton pattern for efficiency. If called with a different config
+    after initialization, logs a warning but returns the existing instance.
     
     Args:
-        config: Optional config to use (only used on first call)
+        config: Config to use. If None and no instance exists, uses defaults.
         
     Returns:
         RAGService instance
@@ -276,6 +277,11 @@ def get_rag_service(config: Optional[RetrieverConfig] = None) -> RAGService:
     
     if _default_service is None:
         _default_service = RAGService(config)
+        logger.info("RAG service singleton created")
+    elif config is not None:
+        # Warn if trying to use different config
+        logger.warning("RAG service already initialized - ignoring new config. "
+                      "Call reset_service() first to use a different config.")
     
     return _default_service
 

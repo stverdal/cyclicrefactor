@@ -6,12 +6,18 @@ from .llm_utils import call_llm
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, QueryIntent
+from utils.syntax_checker import (
+    check_bracket_balance, check_truncation, validate_code_block,
+    ValidationResult, SyntaxIssue, SyntaxIssueType
+)
+from utils.cycle_verifier import verify_cycle_broken, CycleVerificationResult
 from models.schemas import (
     CycleSpec,
     CycleDescription,
     RefactorProposal,
     ValidationReport,
     ValidationIssue,
+    RevertedFile,
 )
 
 logger = get_logger("validator")
@@ -300,61 +306,57 @@ class ValidatorAgent(Agent):
                 refs.add(node)
         return refs
     
-    def _check_syntax_errors(self, path: str, content: str) -> List[ValidationIssue]:
-        """Check for obvious syntax errors without external tools."""
+    def _check_syntax_errors(self, path: str, content: str, original: str = None) -> List[ValidationIssue]:
+        """Check for syntax errors using the shared syntax checker.
+        
+        Args:
+            path: File path
+            content: The patched content to validate
+            original: Optional original content for comparison
+        """
         issues = []
         
-        # Determine language from extension
-        ext = path.split('.')[-1].lower() if '.' in path else ''
+        # Use shared validation that handles multiple languages
+        # Pass original to check_introduced_issues is handled inside validate_code_block
+        result = validate_code_block(content, path, original)
         
-        if ext == 'py':
-            # Python: check for unbalanced brackets/parens
-            issues.extend(self._check_bracket_balance(path, content, 
-                [('(', ')'), ('[', ']'), ('{', '}')]))
-            # Check for common Python syntax issues
-            if re.search(r'^\s*def\s+\w+[^:]*$', content, re.MULTILINE):
-                issues.append(ValidationIssue(
-                    path=path, line=None, 
-                    comment="Possible missing colon after function definition",
-                    severity="major",
-                    issue_type="syntax"
-                ))
-        
-        elif ext == 'cs':
-            # C#: check for unbalanced braces
-            issues.extend(self._check_bracket_balance(path, content, 
-                [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')]))
-            # Check for missing semicolons (heuristic)
-            lines = content.split('\n')
-            for i, line in enumerate(lines, 1):
-                stripped = line.strip()
-                # Lines that should end with ; but don't
-                if (stripped and 
-                    not stripped.endswith((';', '{', '}', ')', ',', '//')) and
-                    not stripped.startswith(('if', 'else', 'for', 'while', 'using', 'namespace', 'class', 'interface', 'public', 'private', 'protected', '//', '/*', '*', '#')) and
-                    not stripped.endswith('=>') and
-                    '=' in stripped and
-                    not stripped.endswith('{')):
-                    # This is a heuristic, may have false positives
-                    pass  # Too noisy, skip for now
+        # Convert SyntaxIssue to ValidationIssue
+        for syntax_issue in result.issues:
+            severity = "critical" if syntax_issue.issue_type in (
+                SyntaxIssueType.UNBALANCED_BRACES,
+                SyntaxIssueType.UNBALANCED_PARENS,
+                SyntaxIssueType.UNBALANCED_BRACKETS,
+                SyntaxIssueType.UNBALANCED_ANGLES,
+                SyntaxIssueType.TRUNCATED_OUTPUT
+            ) else "major"
+            
+            issues.append(ValidationIssue(
+                path=path, 
+                line=syntax_issue.line,
+                comment=syntax_issue.message,
+                severity=severity,
+                issue_type="syntax"
+            ))
         
         return issues
     
     def _check_bracket_balance(self, path: str, content: str, 
                                 pairs: List[Tuple[str, str]]) -> List[ValidationIssue]:
-        """Check if brackets/braces are balanced."""
+        """Check if brackets/braces are balanced (wrapper for shared function)."""
         issues = []
-        for open_char, close_char in pairs:
-            # Simple count (doesn't handle strings/comments, but catches obvious errors)
-            open_count = content.count(open_char)
-            close_count = content.count(close_char)
-            if open_count != close_count:
-                issues.append(ValidationIssue(
-                    path=path, line=None,
-                    comment=f"Unbalanced '{open_char}{close_char}': {open_count} open, {close_count} close",
-                    severity="critical",
-                    issue_type="syntax"
-                ))
+        
+        # Use the shared check_bracket_balance function
+        syntax_issues = check_bracket_balance(content, path)
+        
+        for syntax_issue in syntax_issues:
+            issues.append(ValidationIssue(
+                path=path, 
+                line=None,  # SyntaxIssue doesn't have line attribute
+                comment=syntax_issue.message,
+                severity="critical",
+                issue_type="syntax"
+            ))
+        
         return issues
     
     def _analyze_cycle_impact(self, cycle: CycleSpec, proposal: RefactorProposal) -> Tuple[List[str], List[ValidationIssue]]:
@@ -405,9 +407,62 @@ class ValidatorAgent(Agent):
                     severity="major",
                     issue_type="cycle"
                 ))
-                ))
         
         return observations, issues
+
+    def _verify_cycle_actually_broken(
+        self, 
+        cycle: CycleSpec, 
+        proposal: RefactorProposal
+    ) -> Optional[CycleVerificationResult]:
+        """Use actual cycle detection to verify the cycle is broken.
+        
+        Args:
+            cycle: The cycle specification
+            proposal: The refactor proposal with patches
+            
+        Returns:
+            CycleVerificationResult or None if verification not possible
+        """
+        try:
+            # Build original files list
+            original_files = [
+                {"path": f.path, "content": f.content or ""}
+                for f in cycle.files
+            ]
+            
+            # Build patched files list
+            patched_files = []
+            for f in cycle.files:
+                # Find the patch for this file
+                patch = next(
+                    (p for p in proposal.patches if p.path == f.path or 
+                     p.path.endswith(f.path.split('/')[-1].split('\\')[-1])),
+                    None
+                )
+                
+                if patch and patch.patched:
+                    patched_files.append({"path": f.path, "content": patch.patched})
+                else:
+                    patched_files.append({"path": f.path, "content": f.content or ""})
+            
+            # Run verification
+            result = verify_cycle_broken(
+                original_files=original_files,
+                patched_files=patched_files,
+                cycle_nodes=cycle.graph.nodes,
+                original_edges=cycle.graph.edges
+            )
+            
+            logger.info(f"Cycle verification complete: broken={result.is_broken}, "
+                       f"removed_edges={len(result.removed_edges)}, "
+                       f"remaining_cycles={len(result.remaining_cycles)}")
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Cycle verification failed: {e}")
+            return None
 
     def _rule_based_checks(
         self, cycle: CycleSpec, proposal: RefactorProposal
@@ -423,8 +478,54 @@ class ValidatorAgent(Agent):
 
         logger.info("Running rule-based validation checks...")
 
+        # Handle reverted files from RefactorAgent (now uses RevertedFile model)
+        reverted_files = getattr(proposal, 'reverted_files', []) or []
+        reverted_paths = set()
+        
+        if reverted_files:
+            logger.info(f"RefactorAgent reverted {len(reverted_files)} files due to validation issues")
+            for rf in reverted_files:
+                # Handle both RevertedFile model and dict (for backwards compatibility)
+                if isinstance(rf, RevertedFile):
+                    path = rf.path
+                    reason = rf.reason
+                    warnings = rf.warnings
+                else:
+                    path = rf.get("path", "unknown")
+                    reason = rf.get("reason", "validation failure")
+                    warnings = rf.get("warnings", [])
+                
+                reverted_paths.add(path)
+                
+                # Add observation so LLM knows about reversion
+                observations.append(f"{path}: Reverted by RefactorAgent - {reason}")
+                
+                # Report the reversion as a major issue requiring attention
+                issues.append(ValidationIssue(
+                    path=path,
+                    line=None,
+                    comment=f"RefactorAgent reverted this file: {reason}",
+                    severity="major",
+                    issue_type="semantic"
+                ))
+                
+                # If there are specific warnings, report them for context (limit noise)
+                for warning in warnings[:2]:
+                    issues.append(ValidationIssue(
+                        path=path, 
+                        line=None,
+                        comment=f"Revert detail: {warning}",
+                        severity="info",
+                        issue_type="semantic"
+                    ))
+
         for p in proposal.patches:
             path = p.path
+            
+            # Check if this file was reverted (skip detailed checks, already reported)
+            if path in reverted_paths:
+                logger.debug(f"Skipping detailed checks for reverted file: {path}")
+                continue
             
             # Check patch targets known file
             if path not in known_paths and path.split("/")[-1] not in {
@@ -446,22 +547,68 @@ class ValidatorAgent(Agent):
             
             # Check diff exists (i.e., something changed)
             if p.original == p.patched:
-                issues.append(
-                    ValidationIssue(path=path, line=None, comment="No changes detected in patch",
-                                   severity="minor", issue_type="semantic")
-                )
-                logger.debug(f"No changes in patch: {path}")
+                # Check if this was due to reversion (already handled above)
+                if path not in reverted_paths:
+                    issues.append(
+                        ValidationIssue(path=path, line=None, comment="No changes detected in patch",
+                                       severity="minor", issue_type="semantic")
+                    )
+                    logger.debug(f"No changes in patch: {path}")
             else:
-                # Run syntax checks on changed files
-                syntax_issues = self._check_syntax_errors(path, p.patched or "")
-                if syntax_issues:
-                    logger.warning(f"Syntax issues in {path}: {len(syntax_issues)}")
-                issues.extend(syntax_issues)
+                # Check if RefactorAgent already pre-validated this patch
+                pre_validated = getattr(p, 'pre_validated', False)
+                validation_issues = getattr(p, 'validation_issues', [])
+                
+                if pre_validated:
+                    # Trust RefactorAgent's syntax validation, just report any issues it found
+                    logger.debug(f"Trusting pre-validation for {path} ({len(validation_issues)} issues)")
+                    for issue_msg in validation_issues:
+                        # These are already validated issues - report as info since they passed
+                        if "critical" not in issue_msg.lower():
+                            issues.append(ValidationIssue(
+                                path=path,
+                                line=None,
+                                comment=f"Pre-validation note: {issue_msg}",
+                                severity="minor",
+                                issue_type="syntax"
+                            ))
+                else:
+                    # Run syntax checks on changed files (not pre-validated)
+                    syntax_issues = self._check_syntax_errors(path, p.patched or "", p.original)
+                    if syntax_issues:
+                        logger.warning(f"Syntax issues in {path}: {len(syntax_issues)}")
+                    issues.extend(syntax_issues)
 
-        # Analyze cycle impact
+        # Analyze cycle impact using actual verification
         cycle_observations, cycle_issues = self._analyze_cycle_impact(cycle, proposal)
         observations.extend(cycle_observations)
         issues.extend(cycle_issues)
+        
+        # Run actual cycle verification if we have changes
+        if any(p.diff for p in proposal.patches):
+            verification_result = self._verify_cycle_actually_broken(cycle, proposal)
+            if verification_result:
+                observations.append(f"Cycle verification: {verification_result.analysis}")
+                
+                if not verification_result.is_broken:
+                    issues.append(ValidationIssue(
+                        path="(cycle verification)",
+                        line=None,
+                        comment=f"Cycle NOT broken: {verification_result.analysis}",
+                        severity="major",
+                        issue_type="cycle"
+                    ))
+                    if verification_result.remaining_cycles:
+                        for remaining in verification_result.remaining_cycles[:2]:
+                            issues.append(ValidationIssue(
+                                path="(cycle verification)",
+                                line=None,
+                                comment=f"Remaining cycle: {' -> '.join(remaining)}",
+                                severity="major",
+                                issue_type="cycle"
+                            ))
+                else:
+                    observations.append(f"✓ Verified: Cycle is broken (confidence: {verification_result.confidence:.0%})")
         
         # Log summary
         files_changed = len([p for p in proposal.patches if p.diff])
