@@ -4,6 +4,7 @@ from agents.describer import DescriberAgent
 from agents.refactor_agent import RefactorAgent
 from agents.validator import ValidatorAgent
 from agents.explainer import ExplainerAgent
+from agents.failure_explainer import FailureExplainerAgent
 from agents.dependency_analyzer import DependencyAnalyzerAgent
 from agents.cycle_detector import CycleDetectorAgent
 from utils.persistence import Persistor
@@ -569,18 +570,51 @@ The cycle between **{node_list}** could not be automatically broken.
             if results.get("status") == "unbreakable":
                 unbreakable_reason = UnbreakableReason(results.get("unbreakable_reason", "not_unbreakable"))
             
-            failure_explanation = self._generate_failure_explanation(
-                cycle_spec,
-                description,
-                validation_history,
-                unbreakable_reason,
+            # Use FailureExplainerAgent for detailed failure analysis
+            # This provides actionable guidance for human operators
+            failure_explainer = FailureExplainerAgent(
+                llm=self.llm,
+                include_llm_suggestions=self.llm is not None,
             )
+            
+            # Get the last proposal for detailed analysis
+            last_proposal = ref_result.output if ref_result else None
+            last_validation = val_result.output if val_result else None
+            
+            failure_result = failure_explainer.run(
+                cycle_spec=cycle_spec,
+                description=description,
+                proposal=last_proposal,
+                validation=last_validation,
+                validation_history=validation_history,
+            )
+            
+            if failure_result.status == "success" and failure_result.output:
+                failure_explanation = failure_result.output
+                # Add unbreakable reason if applicable
+                if unbreakable_reason:
+                    failure_explanation["unbreakable_reason"] = unbreakable_reason.value
+            else:
+                # Fallback to basic explanation
+                failure_explanation = self._generate_failure_explanation(
+                    cycle_spec,
+                    description,
+                    validation_history,
+                    unbreakable_reason,
+                )
+            
             results["explanation"] = failure_explanation
             
             # Persist failure explanation
             try:
                 self.persistor.save_json(artifact_id, "explanation/failure_explanation.json", failure_explanation)
-                self.persistor.save_text(artifact_id, "explanation/failure_explanation.md", failure_explanation.get("explanation", ""))
+                # Save markdown report for human review
+                if isinstance(failure_explanation, dict):
+                    markdown = failure_explanation.get("markdown_report") or failure_explanation.get("explanation", "")
+                    self.persistor.save_text(artifact_id, "explanation/failure_explanation.md", markdown)
+                    # Also save the raw LLM response separately for reference
+                    if failure_explanation.get("raw_llm_response"):
+                        self.persistor.save_text(artifact_id, "explanation/llm_raw_response.txt", failure_explanation["raw_llm_response"])
             except Exception as e:
                 logger.warning(f"Failed to persist failure explanation: {e}")
             

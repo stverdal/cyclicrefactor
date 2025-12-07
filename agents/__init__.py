@@ -4,6 +4,7 @@ from .describer import DescriberAgent
 from .refactor_agent import RefactorAgent
 from .validator import ValidatorAgent
 from .explainer import ExplainerAgent
+from .failure_explainer import FailureExplainerAgent
 from .dependency_analyzer import DependencyAnalyzerAgent
 from .cycle_detector import CycleDetectorAgent
 
@@ -14,6 +15,7 @@ __all__ = [
     "RefactorAgent",
     "ValidatorAgent",
     "ExplainerAgent",
+    "FailureExplainerAgent",
     "DependencyAnalyzerAgent",
     "CycleDetectorAgent",
 ]
