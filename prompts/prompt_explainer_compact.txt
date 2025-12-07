@@ -1,0 +1,28 @@
+# Compact Explainer Prompt (for low-VRAM / small context LLMs)
+
+Summarize this refactor for a PR description.
+
+## Cycle: {id}
+Files: {files}
+
+## Problem
+{description}
+
+## Changes
+{diffs}
+
+---
+
+## Output (JSON)
+
+```json
+{
+  "title": "<short title, e.g., 'Break A↔B cycle via interface'>",
+  "summary": "<1-2 sentence TL;DR>",
+  "explanation": "<markdown explanation: problem, solution, impact>",
+  "impact": ["<benefit 1>", "<benefit 2>"],
+  "followup": ["<next steps if any>"]
+}
+```
+
+Keep explanation to 2-3 paragraphs. Output ONLY JSON.

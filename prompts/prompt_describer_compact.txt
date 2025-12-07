@@ -1,0 +1,31 @@
+# Compact Describer Prompt (for low-VRAM / small context LLMs)
+
+Analyze this cyclic dependency and recommend a fix strategy.
+
+## Cycle: {id}
+Graph: {graph}
+Files: {files}
+
+## Source Code
+{file_snippets}
+
+---
+
+## Output (JSON)
+
+```json
+{
+  "text": "<What creates the cycle and why it's problematic>",
+  "cycle_type": "<bidirectional|transitive|layer_violation>",
+  "recommended_strategy": "<interface_extraction|dependency_inversion|shared_module>",
+  "strategy_rationale": "<Why this strategy fits>",
+  "first_steps": ["<action 1>", "<action 2>"]
+}
+```
+
+Strategies:
+- **interface_extraction**: For A↔B bidirectional deps - create interface
+- **dependency_inversion**: For layer violations - invert with abstraction
+- **shared_module**: For transitive cycles - extract common code
+
+Be specific. Reference actual file paths. Output ONLY JSON.

@@ -103,9 +103,22 @@ class Orchestrator:
         """Check if an agent is enabled in config."""
         return self.enabled_agents.get(agent_name, True)
 
-    def _get_prompt_template(self, agent_name: str) -> Optional[str]:
-        """Get prompt template path for an agent from config."""
+    def _get_prompt_template(self, agent_name: str, compact: bool = False) -> Optional[str]:
+        """Get prompt template path for an agent from config.
+        
+        Args:
+            agent_name: Name of the agent (e.g., 'refactor', 'validator')
+            compact: If True, try to get the compact variant
+            
+        Returns:
+            Path to the prompt template file, or None if not configured
+        """
         if hasattr(self.config, "prompts") and isinstance(self.config.prompts, dict):
+            if compact:
+                # Try compact variant first
+                compact_key = f"{agent_name}_compact"
+                if compact_key in self.config.prompts:
+                    return self.config.prompts.get(compact_key)
             return self.config.prompts.get(agent_name)
         return None
 
@@ -349,6 +362,7 @@ The cycle between **{node_list}** could not be automatically broken.
                 refactor = RefactorAgent(
                     llm=self.llm,
                     prompt_template=self._get_prompt_template("refactor"),
+                    prompt_template_compact=self._get_prompt_template("refactor", compact=True),
                     rag_service=self.rag_service,
                     context_window=self.context_window,
                     max_file_chars=self.max_file_chars,

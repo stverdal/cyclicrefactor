@@ -309,6 +309,10 @@ class DetectedCycle(BaseModel):
     severity: str = "major"  # "critical", "major", "minor"
     cycle_type: str = "direct"  # "direct", "indirect", "type-only"
     description: str = ""  # Human-readable description
+    # Impact scoring (enhanced cycle detection)
+    impact_score: Optional[float] = None  # Weighted importance score
+    impact_explanation: Optional[str] = None  # Why this cycle is important
+    layers_involved: List[str] = Field(default_factory=list)  # Architectural layers in cycle
     
     def to_cycle_spec(self, base_dir: str, file_contents: Optional[Dict[str, str]] = None) -> "CycleSpec":
         """Convert to CycleSpec for the existing refactoring pipeline.

@@ -1,0 +1,45 @@
+# Compact Refactor Prompt (for low-VRAM / small context LLMs)
+
+Break the cyclic dependency using SEARCH/REPLACE patches.
+
+## Cycle: {id}
+Graph: {graph}
+Files: {files}
+
+## Description
+{description}
+
+## Strategy: {strategy}
+
+## Source Code
+{file_snippets}
+
+---
+
+## Output Format (JSON with SEARCH/REPLACE)
+
+```json
+{
+  "reasoning": "<brief explanation>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module>",
+  "changes": [
+    {
+      "path": "path/to/file",
+      "search_replace": [
+        {"search": "<3+ lines from source>", "replace": "<new code>"}
+      ]
+    }
+  ]
+}
+```
+
+## CRITICAL RULES
+
+1. **SEARCH must match source EXACTLY** - Copy verbatim from Source Code above
+2. **Include 3+ context lines** - Before AND after the changed code
+3. **Preserve whitespace** - Exact indentation matters
+
+❌ BAD: `"search": "public void Method()"`
+✅ GOOD: `"search": "    // Comment above\n    public void Method() {\n        // body"`
+
+Output ONLY JSON. No commentary.

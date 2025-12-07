@@ -1,0 +1,34 @@
+# Compact Validator Prompt (for low-VRAM / small context LLMs)
+
+Review this refactor proposal that aims to break a cyclic dependency.
+
+## Cycle: {id}
+Graph: {graph}
+Files: {files}
+
+## Proposed Changes
+{diffs}
+
+---
+
+## Check:
+1. Is the cycle broken? (problematic import removed/inverted)
+2. Is syntax valid? (brackets balanced, imports correct)
+3. Is functionality preserved? (no behavior changes)
+
+## Decision:
+- **APPROVED**: Cycle broken, code valid
+- **NEEDS_REVISION**: Cycle remains, syntax errors, or incomplete
+
+## Output (JSON)
+
+```json
+{
+  "decision": "APPROVED|NEEDS_REVISION",
+  "summary": "<one sentence verdict>",
+  "issues": [{"path": "file", "comment": "<issue>", "severity": "critical|major|minor"}],
+  "suggestions": ["<specific fix if NEEDS_REVISION>"]
+}
+```
+
+Output ONLY JSON.

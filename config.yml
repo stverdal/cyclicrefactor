@@ -15,6 +15,16 @@ context:
   # RAG context limits
   max_rag_chars: 1500
 
+# Refactor agent settings
+refactor:
+  min_match_confidence: 0.7   # Minimum confidence to accept SEARCH match
+  warn_confidence: 0.85       # Warn if below this (but still apply)
+  allow_low_confidence: false # Accept matches below min_confidence?
+  atomic_mode: true           # All SEARCH/REPLACE blocks must succeed
+  atomic_proposal: true       # All files must succeed or all reverted
+  compact_prompts: false      # Use shorter prompts for low-VRAM LLMs
+  auto_compact_threshold: 8192  # Auto-enable compact if context below this
+
 io:
   artifacts_dir: artifacts
   cyclic_folder: cyclicDepen
@@ -29,11 +39,16 @@ pipeline:
     validator: true
     explainer: true
 
+# Prompt templates - compact versions used when compact_prompts=true or auto-detected
 prompts:
   describer: prompts/prompt_describer.txt
+  describer_compact: prompts/prompt_describer_compact.txt
   refactor: prompts/prompt_refactor.txt
+  refactor_compact: prompts/prompt_refactor_compact.txt
   validator: prompts/prompt_validator.txt
+  validator_compact: prompts/prompt_validator_compact.txt
   explainer: prompts/prompt_explainer.txt
+  explainer_compact: prompts/prompt_explainer_compact.txt
 
 retriever:
   type: chroma

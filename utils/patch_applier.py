@@ -227,7 +227,17 @@ def try_find_search_text(
     
     if best_fuzzy_match and best_fuzzy_score >= 0.75:
         start_idx, end_idx, score, avg, min_score = best_fuzzy_match
-        # Lower confidence for fuzzy matches (max 0.65)
+        
+        # Special case: near-perfect similarity should get higher confidence
+        # This handles LLM-generated search text that's correct but has minor whitespace differences
+        if avg >= 0.95 and min_score >= 0.90:
+            # High similarity = trust it more (0.95 avg -> 0.75 confidence, 1.0 -> 0.85)
+            confidence = 0.75 + (avg - 0.95) * 2.0
+            confidence = min(0.85, confidence)
+            logger.debug(f"Fuzzy match (high-similarity): lines {start_idx}-{end_idx}, avg_sim={avg:.2f}, min_line={min_score:.2f}, confidence={confidence:.2f}")
+            return MatchResult(start_idx, end_idx, "fuzzy_high_sim", confidence)
+        
+        # Standard fuzzy match: lower confidence (max 0.65)
         confidence = 0.4 + (score - 0.75) * 1.0  # 0.75->0.4, 1.0->0.65
         confidence = min(0.65, max(0.4, confidence))
         logger.debug(f"Fuzzy match: lines {start_idx}-{end_idx}, avg_sim={avg:.2f}, min_line={min_score:.2f}, confidence={confidence:.2f}")

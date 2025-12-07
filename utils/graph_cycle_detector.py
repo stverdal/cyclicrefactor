@@ -24,11 +24,31 @@ logger = get_logger("graph_cycle_detector")
 
 @dataclass
 class CycleDetectorConfig:
-    """Configuration for cycle detection."""
+    """Configuration for cycle detection.
+    
+    Attributes:
+        max_cycles: Maximum total cycles to return
+        max_cycles_per_scc: Maximum cycles to find per strongly connected component
+        include_minor: Whether to include minor (2-node) cycles
+        include_type_only: Whether to include type-only import cycles
+        ignore_modules: List of module/file names to exclude from cycle detection
+        ignore_patterns: List of patterns (e.g., "*Test*") to exclude
+        layers: Dict mapping folder/module names to layer names (for cross-layer detection)
+        known_cycles: List of known cycles that should get priority boost
+        min_impact_score: Minimum impact score threshold (0.0 to skip filtering)
+    """
     max_cycles: int = 100
     max_cycles_per_scc: int = 50
     include_minor: bool = True
     include_type_only: bool = True
+    # Filtering options
+    ignore_modules: List[str] = field(default_factory=list)
+    ignore_patterns: List[str] = field(default_factory=list)
+    # Layer-based scoring
+    layers: Dict[str, str] = field(default_factory=dict)
+    known_cycles: List[List[str]] = field(default_factory=list)
+    # Score threshold
+    min_impact_score: float = 0.0
 
 
 def build_adjacency_list(edges: List[List[str]]) -> Dict[str, Set[str]]:
@@ -260,6 +280,207 @@ def generate_cycle_id(nodes: List[str]) -> str:
     return hashlib.md5(cycle_str.encode()).hexdigest()[:12]
 
 
+def should_ignore_node(
+    node: str,
+    ignore_modules: List[str],
+    ignore_patterns: List[str],
+) -> bool:
+    """Check if a node should be ignored based on ignore configuration.
+    
+    Args:
+        node: The node name (file path or module name)
+        ignore_modules: Exact module names to ignore
+        ignore_patterns: Patterns like "*Test*" to ignore
+        
+    Returns:
+        True if the node should be ignored
+    """
+    import fnmatch
+    import os
+    
+    # Get just the filename/module name
+    basename = os.path.basename(node)
+    module_name = os.path.splitext(basename)[0]
+    
+    # Check exact matches
+    if node in ignore_modules or basename in ignore_modules or module_name in ignore_modules:
+        return True
+    
+    # Check patterns
+    for pattern in ignore_patterns:
+        if fnmatch.fnmatch(node, pattern) or fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(module_name, pattern):
+            return True
+        # Also check case-insensitive for common patterns like "test"
+        if fnmatch.fnmatch(node.lower(), pattern.lower()):
+            return True
+    
+    return False
+
+
+def get_layer_for_node(node: str, layers: Dict[str, str]) -> str:
+    """Get the architectural layer for a node based on path/name.
+    
+    Args:
+        node: File path or module name
+        layers: Mapping from folder/module names to layer names
+        
+    Returns:
+        Layer name or "Unknown"
+    """
+    import os
+    
+    # Check direct match
+    basename = os.path.basename(node)
+    module_name = os.path.splitext(basename)[0]
+    
+    if module_name in layers:
+        return layers[module_name]
+    if basename in layers:
+        return layers[basename]
+    
+    # Check path components
+    path_parts = os.path.normpath(node).split(os.sep)
+    for part in path_parts:
+        if part in layers:
+            return layers[part]
+        # Case-insensitive match
+        for key, layer in layers.items():
+            if part.lower() == key.lower():
+                return layer
+    
+    return "Unknown"
+
+
+@dataclass
+class CycleImpactScore:
+    """Detailed impact score for a cycle with explanation."""
+    total_score: float
+    length_score: float
+    centrality_score: float
+    edge_weight_score: float
+    cross_layer_score: float
+    known_cycle_boost: float
+    overlap_score: float
+    layers_involved: List[str]
+    explanation: str
+
+
+def compute_cycle_impact_score(
+    cycle_nodes: List[str],
+    all_cycles: List[List[str]],
+    adj_list: Dict[str, Set[str]],
+    layers: Dict[str, str],
+    known_cycles: List[List[str]],
+    edge_weights: Optional[Dict[Tuple[str, str], float]] = None,
+) -> CycleImpactScore:
+    """Compute impact score for a cycle using multiple factors.
+    
+    Scoring factors (similar to parse_important_cycles.py):
+    1. Length Score: Larger cycles are more problematic
+    2. Centrality Score: Cycles involving highly-connected nodes are worse
+    3. Edge Weight Score: Strong coupling (many references) is worse
+    4. Cross-Layer Score: Cycles spanning architectural layers are worse
+    5. Known Cycle Boost: Known problematic cycles get priority
+    6. Overlap Score: Cycles sharing nodes with other cycles are worse
+    
+    Args:
+        cycle_nodes: Nodes in this cycle
+        all_cycles: All detected cycles for overlap calculation
+        adj_list: Adjacency list for centrality calculation
+        layers: Layer mapping for cross-layer detection
+        known_cycles: Known problematic cycles to boost
+        edge_weights: Optional edge weight mapping
+        
+    Returns:
+        CycleImpactScore with detailed breakdown
+    """
+    cycle_size = len(cycle_nodes)
+    
+    # 1. Length score (longer cycles = more complex)
+    length_score = float(cycle_size)
+    
+    # 2. Centrality score (average degree centrality)
+    total_nodes = len(adj_list)
+    if total_nodes > 1:
+        centrality_sum = 0.0
+        for node in cycle_nodes:
+            # Degree = in-degree + out-degree
+            out_degree = len(adj_list.get(node, set()))
+            in_degree = sum(1 for n, edges in adj_list.items() if node in edges)
+            centrality = (out_degree + in_degree) / (2 * (total_nodes - 1))
+            centrality_sum += centrality
+        avg_centrality = centrality_sum / cycle_size
+    else:
+        avg_centrality = 0.0
+    centrality_score = 2.0 * avg_centrality
+    
+    # 3. Edge weight score
+    edge_weight_score = 0.0
+    if edge_weights:
+        for i in range(cycle_size):
+            src = cycle_nodes[i]
+            dst = cycle_nodes[(i + 1) % cycle_size]
+            weight = edge_weights.get((src, dst), 1.0)
+            edge_weight_score += 0.5 * weight
+    
+    # 4. Cross-layer score
+    layers_involved = list(set(get_layer_for_node(node, layers) for node in cycle_nodes))
+    cross_layer_count = len([l for l in layers_involved if l != "Unknown"])
+    cross_layer_score = 10.0 if cross_layer_count > 1 else 0.0
+    
+    # 5. Known cycle boost
+    known_cycle_boost = 0.0
+    cycle_set = set(cycle_nodes)
+    for known in known_cycles:
+        if set(known) == cycle_set or set(known[::-1]) == cycle_set:
+            known_cycle_boost = 10.0
+            break
+    
+    # 6. Overlap score (cycles sharing nodes with many other cycles)
+    overlap_count = sum(
+        1 for other in all_cycles
+        if set(other) != cycle_set and len(cycle_set & set(other)) > 0
+    )
+    overlap_score = min(overlap_count * 0.5, 5.0)  # Cap at 5
+    
+    # Total score
+    total_score = (
+        length_score +
+        centrality_score +
+        edge_weight_score +
+        cross_layer_score +
+        known_cycle_boost +
+        overlap_score
+    )
+    
+    # Build explanation
+    reasons = []
+    if cross_layer_score > 0:
+        reasons.append(f"Crosses {cross_layer_count} architectural layers ({', '.join(layers_involved)})")
+    if edge_weight_score > 5:
+        reasons.append("High coupling strength between modules")
+    if cycle_size > 3:
+        reasons.append(f"Complex cycle involving {cycle_size} files")
+    if overlap_count > 0:
+        reasons.append(f"Interconnected with {overlap_count} other cycle(s)")
+    if known_cycle_boost > 0:
+        reasons.append("Known problematic cycle")
+    if not reasons:
+        reasons.append("Simple cycle with limited impact")
+    
+    return CycleImpactScore(
+        total_score=total_score,
+        length_score=length_score,
+        centrality_score=round(centrality_score, 3),
+        edge_weight_score=round(edge_weight_score, 3),
+        cross_layer_score=cross_layer_score,
+        known_cycle_boost=known_cycle_boost,
+        overlap_score=overlap_score,
+        layers_involved=layers_involved,
+        explanation=" | ".join(reasons),
+    )
+
+
 def classify_cycle_severity(
     cycle_nodes: List[str],
     all_cycles: List[List[str]],
@@ -309,27 +530,63 @@ def find_cycles(
 ) -> List["DetectedCycle"]:
     """Find all cyclic dependencies in a dependency graph.
     
+    This enhanced version supports:
+    - Ignore lists: Skip modules/files that aren't of concern
+    - Layer-based scoring: Prioritize cross-layer cycles
+    - Impact scoring: Rank cycles by their importance
+    - Known cycle boosting: Prioritize previously identified problem cycles
+    
     Args:
         dependency_graph: The dependency graph to analyze
-        config: Optional configuration object
+        config: Optional configuration object with ignore lists, layers, etc.
         max_cycles_per_scc: Max cycles to find per SCC (prevents explosion)
         include_type_only: Include type-only import cycles
         
     Returns:
-        List of DetectedCycle objects
+        List of DetectedCycle objects, sorted by impact score
     """
     from models.schemas import DetectedCycle
     
-    # Use config if provided
-    if config:
-        max_cycles_per_scc = config.max_cycles_per_scc
-        include_type_only = config.include_type_only
-        logger.debug(f"Cycle detection config: max_cycles_per_scc={max_cycles_per_scc}, include_type_only={include_type_only}")
+    # Default config if not provided
+    if config is None:
+        config = CycleDetectorConfig()
+    
+    max_cycles_per_scc = config.max_cycles_per_scc
+    include_type_only = config.include_type_only
+    
+    logger.debug(f"Cycle detection config: max_cycles_per_scc={max_cycles_per_scc}, "
+                 f"include_type_only={include_type_only}, "
+                 f"ignore_modules={len(config.ignore_modules)}, "
+                 f"ignore_patterns={len(config.ignore_patterns)}, "
+                 f"layers={len(config.layers)}, "
+                 f"min_impact_score={config.min_impact_score}")
     
     edges = dependency_graph.edges
     original_edge_count = len(edges)
     
-    # Filter edges if needed
+    # Filter edges for ignored modules
+    if config.ignore_modules or config.ignore_patterns:
+        filtered_edges = []
+        ignored_nodes = set()
+        
+        for edge in edges:
+            src, dst = edge[0], edge[1]
+            src_ignored = should_ignore_node(src, config.ignore_modules, config.ignore_patterns)
+            dst_ignored = should_ignore_node(dst, config.ignore_modules, config.ignore_patterns)
+            
+            if src_ignored:
+                ignored_nodes.add(src)
+            if dst_ignored:
+                ignored_nodes.add(dst)
+                
+            if not src_ignored and not dst_ignored:
+                filtered_edges.append(edge)
+        
+        if ignored_nodes:
+            logger.info(f"Ignored {len(ignored_nodes)} nodes matching ignore list: {list(ignored_nodes)[:5]}...")
+        edges = filtered_edges
+    
+    # Filter edges if needed (type-only)
     if not include_type_only:
         type_only_imports = {
             (i.source_file, i.imported_from)
@@ -346,7 +603,7 @@ def find_cycles(
     # Build adjacency list
     adj_list = build_adjacency_list(edges)
     
-    logger.info(f"Analyzing graph with {len(adj_list)} nodes")
+    logger.info(f"Analyzing graph with {len(adj_list)} nodes (after filtering)")
     
     # Find strongly connected components
     sccs = find_strongly_connected_components(adj_list)
@@ -367,23 +624,52 @@ def find_cycles(
     
     logger.info(f"Found {len(all_cycles)} elementary cycles")
     
-    # Convert to DetectedCycle objects
+    # Build edge weights from import info (number of symbols = coupling strength)
+    edge_weights = {}
+    for imp in dependency_graph.imports:
+        key = (imp.source_file, imp.resolved_path or imp.imported_from)
+        # Weight by number of symbols imported (more = tighter coupling)
+        edge_weights[key] = edge_weights.get(key, 0) + max(len(imp.symbols), 1)
+    
+    # Convert to DetectedCycle objects with impact scoring
     detected_cycles = []
     graph_size = len(adj_list)
     severity_counts = {"critical": 0, "major": 0, "minor": 0}
     
-    logger.debug(f"Converting {len(all_cycles)} raw cycles to DetectedCycle objects")
+    logger.debug(f"Computing impact scores for {len(all_cycles)} cycles")
     
     for cycle_nodes in all_cycles:
+        # Compute impact score for this cycle
+        impact = compute_cycle_impact_score(
+            cycle_nodes=cycle_nodes,
+            all_cycles=all_cycles,
+            adj_list=adj_list,
+            layers=config.layers,
+            known_cycles=config.known_cycles,
+            edge_weights=edge_weights if edge_weights else None,
+        )
+        
+        # Filter by minimum impact score
+        if config.min_impact_score > 0 and impact.total_score < config.min_impact_score:
+            logger.debug(f"Skipping cycle {cycle_nodes[:2]}... (score {impact.total_score:.2f} < {config.min_impact_score})")
+            continue
+        
         # Get edges that form this cycle
-        cycle_set = set(cycle_nodes)
         cycle_edges = []
         for i, node in enumerate(cycle_nodes):
             next_node = cycle_nodes[(i + 1) % len(cycle_nodes)]
             cycle_edges.append([node, next_node])
         
         cycle_id = generate_cycle_id(cycle_nodes)
-        severity = classify_cycle_severity(cycle_nodes, all_cycles, graph_size)
+        
+        # Determine severity based on impact score
+        if impact.total_score >= 15 or impact.cross_layer_score > 0:
+            severity = "critical"
+        elif impact.total_score >= 8:
+            severity = "major"
+        else:
+            severity = "minor"
+        
         severity_counts[severity] = severity_counts.get(severity, 0) + 1
         
         # Create description
@@ -392,6 +678,9 @@ def find_cycles(
         else:
             desc = f"Circular dependency chain: {' → '.join(cycle_nodes)} → {cycle_nodes[0]}"
         
+        if impact.cross_layer_score > 0:
+            desc += f" (crosses layers: {', '.join(impact.layers_involved)})"
+        
         detected_cycles.append(DetectedCycle(
             id=f"cycle_{cycle_id}",
             nodes=cycle_nodes,
@@ -399,14 +688,21 @@ def find_cycles(
             severity=severity,
             cycle_type="direct" if len(cycle_nodes) == 2 else "indirect",
             description=desc,
+            impact_score=round(impact.total_score, 2),
+            impact_explanation=impact.explanation,
+            layers_involved=impact.layers_involved,
         ))
     
-    # Sort by severity (critical first) then by size
-    severity_order = {"critical": 0, "major": 1, "minor": 2}
-    detected_cycles.sort(key=lambda c: (severity_order.get(c.severity, 1), -len(c.nodes)))
+    # Sort by impact score (highest first), then by severity
+    detected_cycles.sort(key=lambda c: (-c.impact_score if c.impact_score else 0, 
+                                         {"critical": 0, "major": 1, "minor": 2}.get(c.severity, 1)))
     
     logger.info(f"Cycle detection complete: {len(detected_cycles)} cycles "
                 f"(critical={severity_counts['critical']}, major={severity_counts['major']}, minor={severity_counts['minor']})")
+    
+    if detected_cycles:
+        top_cycle = detected_cycles[0]
+        logger.info(f"Top priority cycle: {top_cycle.nodes[:3]}... (score={top_cycle.impact_score}, {top_cycle.severity})")
     
     return detected_cycles
 

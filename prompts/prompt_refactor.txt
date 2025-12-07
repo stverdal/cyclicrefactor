@@ -86,8 +86,8 @@ For files over 100 lines, use targeted changes instead of full content:
       "path": "path/to/file.ext",
       "search_replace": [
         {
-          "search": "<exact text to find - include 2-3 context lines>",
-          "replace": "<replacement text>"
+          "search": "<EXACT text from source - include 3+ context lines before AND after>",
+          "replace": "<replacement text with same surrounding context>"
         }
       ]
     }
@@ -100,37 +100,65 @@ For files over 100 lines, use targeted changes instead of full content:
 ```
 --- FILE: path/to/file.ext ---
 <<<<<<< SEARCH
+// 3+ lines of context BEFORE the change
 original code block to find
+// 3+ lines of context AFTER the change
 =======
+// same context lines BEFORE
 replacement code block
->>>>>>> REPLACE
-
-<<<<<<< SEARCH
-another block to change
-=======
-its replacement
+// same context lines AFTER
 >>>>>>> REPLACE
 ```
 
-## Critical Requirements
+---
 
-### SEARCH Text Matching (VERY IMPORTANT)
-1. **COPY EXACT TEXT** - The SEARCH text must be copied character-for-character from the source code shown above
-2. **INCLUDE CONTEXT** - Include 2-3 lines before AND after the code you want to change
-3. **PRESERVE WHITESPACE** - Keep exact indentation (spaces vs tabs matter)
-4. **DO NOT GUESS** - If you don't see the exact code in the source, don't invent it
-5. **CHECK YOUR SEARCH TEXT** - Before outputting, verify each SEARCH block appears verbatim in the source
+## ⚠️ CRITICAL: SEARCH Text Matching Rules ⚠️
 
-### Common Mistakes to Avoid
-- ❌ Changing indentation (4 spaces vs 2 spaces vs tabs)
+**Your SEARCH text MUST be found exactly in the source code. Follow these rules:**
+
+### Rule 1: COPY FROM SOURCE - NOT FROM MEMORY
+- Look at the Source Code section above
+- Find the exact lines you want to change
+- Copy them character-for-character into your SEARCH block
+- DO NOT type what you think the code looks like
+
+### Rule 2: ALWAYS INCLUDE 3+ LINES OF CONTEXT
+Bad (will fail):
+```
+"search": "public SensorType SensorType { get; init; } = null!;"
+```
+
+Good (will succeed):
+```
+"search": "    [JsonPropertyName(\"sensorType\")]\n    public SensorType SensorType { get; init; } = null!;\n\n    [JsonPropertyName(\"unit\")]"
+```
+
+### Rule 3: PRESERVE EXACT WHITESPACE
+- Count the spaces at the start of each line
+- Use the same indentation (spaces vs tabs)
+- Keep blank lines exactly as they appear
+- Match trailing whitespace
+
+### Rule 4: VERIFY BEFORE OUTPUT
+Before outputting each SEARCH block, ask yourself:
+> "Can I find this EXACT text in the Source Code section above?"
+If NO, fix it or include more context.
+
+### Common Mistakes That Cause Failures
+- ❌ Single-line SEARCH with no context (TOO AMBIGUOUS)
+- ❌ Changing indentation (4 spaces → 2 spaces)
 - ❌ Adding/removing blank lines
-- ❌ Guessing code that wasn't shown in the source
-- ❌ Using ellipsis (...) or "// existing code" comments
-- ❌ Changing casing or punctuation
+- ❌ Guessing code not shown in source
+- ❌ Using "..." or "// existing code" placeholders
+- ❌ Changing variable casing or punctuation
 
-### Other Requirements
-1. Ensure all imports are valid after refactoring
-2. Preserve existing public APIs and functionality
-3. Actually REMOVE or INVERT the problematic dependency
+---
 
-Only output the JSON or file markers, no additional commentary.
+## Final Requirements
+
+1. **Break the cycle** - Actually remove or invert the problematic dependency
+2. **Preserve functionality** - Don't change behavior, only structure
+3. **Valid imports** - Ensure all imports work after changes
+4. **Minimal changes** - Only modify what's necessary
+
+Output ONLY the JSON or file markers. No additional commentary.

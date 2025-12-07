@@ -59,11 +59,22 @@ class CycleDetectorAgent(Agent):
                 - max_cycles: Maximum cycles to find (default 100)
                 - min_severity: Minimum severity to report ("minor", "major", "critical")
                 - include_minor: Whether to include minor cycles (default True)
+                - ignore_modules: List of module names to ignore (e.g., ["Tests", "Mocks"])
+                - ignore_patterns: Glob patterns for files to ignore (e.g., ["*Test*", "*Mock*"])
+                - layers: Dict mapping folder/module names to layer names for cross-layer detection
+                - known_cycles: List of known problematic cycles to boost (each is a list of nodes)
+                - min_impact_score: Minimum impact score threshold (default 0.0)
         """
         self.config = config or {}
         self.max_cycles = self.config.get("max_cycles", 100)
         self.min_severity = self.config.get("min_severity", "minor")
         self.include_minor = self.config.get("include_minor", True)
+        # New enhanced scoring options
+        self.ignore_modules = self.config.get("ignore_modules", [])
+        self.ignore_patterns = self.config.get("ignore_patterns", [])
+        self.layers = self.config.get("layers", {})
+        self.known_cycles = self.config.get("known_cycles", [])
+        self.min_impact_score = self.config.get("min_impact_score", 0.0)
     
     def run(self, input_data: Dict[str, Any]) -> AgentResult:
         """Detect cycles in a dependency graph.
@@ -112,16 +123,31 @@ class CycleDetectorAgent(Agent):
         include_minor = input_data.get("include_minor", self.include_minor)
         project_dir = input_data.get("project_dir", graph.root_dir or "")
         
+        # Enhanced config options - can be overridden per-call
+        ignore_modules = input_data.get("ignore_modules", self.ignore_modules)
+        ignore_patterns = input_data.get("ignore_patterns", self.ignore_patterns)
+        layers = input_data.get("layers", self.layers)
+        known_cycles = input_data.get("known_cycles", self.known_cycles)
+        min_impact_score = input_data.get("min_impact_score", self.min_impact_score)
+        
         logger.info(f"Detecting cycles in graph with {len(graph.nodes)} nodes, {len(graph.edges)} edges")
         logger.debug(f"Max cycles: {max_cycles}, include minor: {include_minor}")
         logger.debug(f"Min severity filter: {self.min_severity}")
+        logger.debug(f"Ignore modules: {len(ignore_modules)}, patterns: {len(ignore_patterns)}")
+        logger.debug(f"Layers configured: {len(layers)}, known cycles: {len(known_cycles)}")
+        logger.debug(f"Min impact score threshold: {min_impact_score}")
         logger.debug(f"Project dir for file resolution: {project_dir or '(not set)'}")
         
         try:
-            # Configure detector
+            # Configure detector with enhanced options
             detector_config = CycleDetectorConfig(
                 max_cycles=max_cycles,
                 include_minor=include_minor,
+                ignore_modules=ignore_modules,
+                ignore_patterns=ignore_patterns,
+                layers=layers,
+                known_cycles=known_cycles,
+                min_impact_score=min_impact_score,
             )
             
             # Run cycle detection
@@ -222,37 +248,50 @@ class CycleDetectorAgent(Agent):
     def get_prioritized_cycles(
         self, 
         cycles: List[DetectedCycle],
-        strategy: str = "severity_first",
+        strategy: str = "impact_first",
     ) -> List[DetectedCycle]:
         """Sort cycles by priority for refactoring order.
         
         Args:
             cycles: List of detected cycles
             strategy: Prioritization strategy:
+                - "impact_first": By computed impact score (default, recommended)
                 - "severity_first": Critical > Major > Minor
                 - "size_first": Smaller cycles first (easier to fix)
-                - "impact_first": Based on number of affected files
+                - "cross_layer_first": Prioritize cycles crossing architectural layers
                 
         Returns:
             Sorted list of cycles
         """
-        if strategy == "severity_first":
+        if strategy == "impact_first":
+            # Sort by impact score (highest first), then by size
+            return sorted(cycles, key=lambda c: (
+                -(c.impact_score or 0),
+                len(c.nodes),  # Smaller cycles first within same score
+            ))
+        
+        elif strategy == "severity_first":
             severity_order = {"critical": 0, "major": 1, "minor": 2}
             return sorted(cycles, key=lambda c: (
                 severity_order.get(c.severity, 2),
+                -(c.impact_score or 0),  # Then by impact score
                 len(c.nodes),  # Smaller cycles first within severity
             ))
         
         elif strategy == "size_first":
-            return sorted(cycles, key=lambda c: len(c.nodes))
+            return sorted(cycles, key=lambda c: (len(c.nodes), -(c.impact_score or 0)))
         
-        elif strategy == "impact_first":
-            # Sort by total edges (more connections = higher impact)
-            return sorted(cycles, key=lambda c: len(c.edges), reverse=True)
+        elif strategy == "cross_layer_first":
+            # Prioritize cycles that cross architectural layers
+            return sorted(cycles, key=lambda c: (
+                -(len(c.layers_involved) if hasattr(c, 'layers_involved') and c.layers_involved else 0),
+                -(c.impact_score or 0),
+                len(c.nodes),
+            ))
         
         else:
-            # Default: severity first
-            return self.get_prioritized_cycles(cycles, "severity_first")
+            # Default: impact first
+            return self.get_prioritized_cycles(cycles, "impact_first")
     
     def analyze_and_detect(
         self, 

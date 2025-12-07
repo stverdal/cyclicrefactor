@@ -32,6 +32,8 @@ class RefactorConfig(BaseModel):
     compile_check: bool = False         # If True, run language-specific compile/lint check on patches
     compile_check_timeout: int = 30     # Timeout in seconds for compile commands
     revert_on_compile_error: bool = True  # If True, revert files that fail compile check
+    compact_prompts: bool = False       # If True, use shorter prompts for low-VRAM/small context LLMs
+    auto_compact_threshold: int = 8192  # Auto-enable compact prompts if context window below this
 
 
 class IOConfig(BaseModel):

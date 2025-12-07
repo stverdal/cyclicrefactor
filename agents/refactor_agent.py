@@ -136,6 +136,7 @@ After:
         self,
         llm=None,
         prompt_template: str = None,
+        prompt_template_compact: str = None,
         max_file_chars: int = 4000,
         rag_service=None,
         context_window: int = 4096,
@@ -143,6 +144,7 @@ After:
     ):
         self.llm = llm
         self.prompt_template = prompt_template
+        self.prompt_template_compact = prompt_template_compact
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
@@ -154,6 +156,32 @@ After:
             enabled=self.refactor_config.compile_check,
             timeout=self.refactor_config.compile_check_timeout,
         )
+        
+        # Determine if compact prompts should be used
+        self.use_compact_prompts = self._should_use_compact_prompts()
+        if self.use_compact_prompts:
+            logger.info(f"Using compact prompts (context_window={context_window}, compact_enabled={self.refactor_config.compact_prompts})")
+    
+    def _should_use_compact_prompts(self) -> bool:
+        """Determine whether to use compact prompts based on config and context window."""
+        # Explicit config takes precedence
+        if self.refactor_config.compact_prompts:
+            return True
+        
+        # Auto-detect based on context window size
+        threshold = getattr(self.refactor_config, 'auto_compact_threshold', 8192)
+        if self.context_window < threshold:
+            logger.debug(f"Auto-enabling compact prompts: context_window={self.context_window} < threshold={threshold}")
+            return True
+        
+        return False
+    
+    def _get_prompt_template(self) -> Optional[str]:
+        """Get the appropriate prompt template based on compact mode."""
+        if self.use_compact_prompts and self.prompt_template_compact:
+            logger.debug("Using compact prompt template")
+            return self.prompt_template_compact
+        return self.prompt_template
 
     def _extract_strategy_from_description(self, description: CycleDescription) -> Optional[str]:
         """Extract the recommended strategy from the Describer's output."""
@@ -391,12 +419,16 @@ After:
                 rag_context = truncate_to_token_budget(rag_context, rag_token_budget, "prose")
         
         # Get pattern example (skip if we have syntax errors - focus on fixing the code)
+        # Also skip for compact prompts to save tokens
         pattern_example = ""
-        if not skip_rag:
+        if not skip_rag and not self.use_compact_prompts:
             pattern_example = self._get_pattern_example(strategy)
 
-        if self.prompt_template:
-            tpl = load_template(self.prompt_template)
+        # Use compact template if available and appropriate
+        template_path = self._get_prompt_template()
+        
+        if template_path:
+            tpl = load_template(template_path)
             result = safe_format(
                 tpl,
                 id=cycle.id,
