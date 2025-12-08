@@ -25,8 +25,12 @@ refactor:
   compact_prompts: true       # Use shorter prompts for low-VRAM LLMs
   auto_compact_threshold: 8192  # Auto-enable compact if context below this
   # Sequential file mode - two-phase approach for better results
-  sequential_file_mode: true    # If true: plan first, then patch each file separately
+  sequential_file_mode: false   # Disabled when suggestion_mode is on
   auto_sequential_threshold: 3  # Auto-enable if cycle has >= N files
+  # Suggestion mode - output human-reviewable suggestions instead of applying patches
+  suggestion_mode: true         # If true, output suggestions for review (no patches applied)
+  suggestion_context_lines: 7   # Lines of context around changes
+  suggestion_output_format: markdown  # "markdown" or "json"
   # Auto-repair settings
   auto_repair_syntax: true      # Attempt to auto-repair syntax errors in LLM output
   auto_repair_min_confidence: 0.6  # Minimum confidence to accept auto-repair
