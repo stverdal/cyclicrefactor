@@ -183,6 +183,11 @@ class DescriberAgent(Agent):
         
         # Build recommended strategies based on cycle type
         strategy_hints = self._get_strategy_hints(analysis)
+        
+        # Add weakest edge recommendation if available (for larger cycles)
+        weakest_edge_hint = self._get_weakest_edge_hint(cycle)
+        if weakest_edge_hint:
+            strategy_hints = weakest_edge_hint + "\n" + strategy_hints
 
         if self.prompt_template:
             tpl = load_template(self.prompt_template)
@@ -282,6 +287,7 @@ Analyze this cycle and provide:
 - Identify common functionality used by multiple modules
 - Extract to a new shared module with no dependencies on the cycle members
 - Update all cycle members to depend on shared module instead of each other
+- Focus on breaking the WEAKEST edge first (lowest coupling)
 """)
         
         if not hints:
@@ -293,6 +299,22 @@ Analyze this cycle and provide:
 """)
         
         return "\n".join(hints)
+    
+    def _get_weakest_edge_hint(self, cycle_spec: CycleSpec) -> str:
+        """Extract weakest edge recommendation if available in cycle data."""
+        cycle_dict = cycle_spec.model_dump() if hasattr(cycle_spec, 'model_dump') else cycle_spec
+        
+        weakest_edge = cycle_dict.get("weakest_edge")
+        if not weakest_edge:
+            return ""
+        
+        return f\"\"\"
+**Recommended Break Point (Weakest Edge)**:
+The edge from `{weakest_edge.get('source')}` → `{weakest_edge.get('target')}` is the best candidate to break.
+Reason: {weakest_edge.get('reason', 'lowest coupling in cycle')}
+
+Focus your refactoring on removing or inverting this specific dependency.
+\"\"\"
 
     def run(self, cycle_spec: Union[CycleSpec, Dict[str, Any]], prompt: str = None) -> AgentResult:
         """Describe the cyclic dependency with classification and strategy recommendations.
