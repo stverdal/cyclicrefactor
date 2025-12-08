@@ -1,0 +1,191 @@
+# Suggestion Mode - Refactoring Proposal Prompt
+
+You are an expert software engineer specializing in breaking cyclic dependencies.
+Your task is to **propose refactoring changes** for human review, NOT to output patches.
+
+## Cycle Information
+- ID: {id}
+- Dependency graph: {graph}
+- Affected files: {files}
+
+## Problem Description (from Describer)
+{description}
+
+## Recommended Strategy: {strategy}
+
+## Pattern Reference
+{pattern_example}
+
+## Source Code
+{file_snippets}
+
+## Reference Materials (from architecture literature)
+{rag_context}
+
+---
+
+## Your Task: Propose Changes (Don't Apply Them)
+
+You will output a JSON describing what changes SHOULD be made. A human will review
+these suggestions and decide whether to apply them.
+
+### Think Step-by-Step
+
+**Step 1: Identify the Problem**
+- Which import/reference creates the cycle?
+- What is the direction of the problematic dependency?
+
+**Step 2: Design the Solution**
+Based on the recommended strategy:
+- **Interface Extraction**: Define a new interface; have the concrete class implement it
+- **Dependency Inversion**: Create an abstraction in the higher-level module
+- **Shared Module**: Extract common code to a new dependency-free module
+
+**Step 3: Describe Each Change**
+For each file that needs modification:
+- What lines need to change?
+- What is the original code?
+- What should replace it?
+- WHY is this change needed?
+
+---
+
+## Output Format
+
+```json
+{
+  "summary": "<1-2 sentence overview of the refactoring approach>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|lazy_import|parameter_injection|other>",
+  "why_this_breaks_the_cycle": "<explain how these changes break the dependency cycle>",
+  "new_files": [
+    {
+      "path": "path/to/NewInterface.ext",
+      "purpose": "<why this file is needed>",
+      "content": "<complete file content>"
+    }
+  ],
+  "modifications": [
+    {
+      "path": "path/to/existing_file.ext",
+      "changes": [
+        {
+          "what": "<brief description: e.g., 'Change type annotation from concrete to interface'>",
+          "why": "<reason: e.g., 'This inverts the dependency direction'>",
+          "search": "<EXACT text to find in the file - include 3+ lines of context>",
+          "replace": "<what to replace it with - same context lines>",
+          "add_imports": ["<any new imports needed for this file>"]
+        }
+      ]
+    }
+  ],
+  "suggested_order": [
+    "1. Create NewInterface.ext - establishes the abstraction",
+    "2. Modify ExistingFile.ext - changes dependency to use abstraction",
+    "..."
+  ],
+  "risks_and_notes": [
+    "<any risks, edge cases, or things the reviewer should verify>"
+  ],
+  "confidence": "<high|medium|low>"
+}
+```
+
+---
+
+## Important Guidelines
+
+### For `search` Text
+- **COPY EXACTLY** from the Source Code section above
+- Include 3+ lines of context BEFORE and AFTER the target
+- Preserve exact whitespace (spaces, tabs, blank lines)
+- If you cannot find the exact text, describe the location instead:
+  - `"search": "// Around line 45, in the constructor"` (for reviewer reference)
+
+### For `new_files`
+- Provide COMPLETE, valid file content
+- Include all necessary: namespace/package, imports, class/interface definition
+- Choose a path that avoids creating new cycles (e.g., `Interfaces/` folder)
+
+### For `modifications`
+- Explain WHAT and WHY for each change
+- Group related changes together
+- Order changes logically (e.g., add interface first, then modify usages)
+
+### For Confidence Level
+- **high**: Changes are straightforward, low risk
+- **medium**: Changes should work but have some complexity
+- **low**: Uncertain about exact implementation, needs careful review
+
+---
+
+## Example Output
+
+```json
+{
+  "summary": "Extract ISensorType interface to break the cycle between Sensor and SensorType",
+  "strategy_used": "interface_extraction",
+  "why_this_breaks_the_cycle": "By having Sensor depend on ISensorType instead of SensorType directly, we invert the dependency. SensorType can implement ISensorType without Sensor needing to know about the concrete class.",
+  "new_files": [
+    {
+      "path": "Interfaces/ISensorType.cs",
+      "purpose": "Abstraction for SensorType to decouple Sensor from the concrete implementation",
+      "content": "namespace MyApp.Interfaces\n{\n    public interface ISensorType\n    {\n        string Name { get; }\n        string Unit { get; }\n    }\n}"
+    }
+  ],
+  "modifications": [
+    {
+      "path": "Models/Sensor.cs",
+      "changes": [
+        {
+          "what": "Add import for the new interface",
+          "why": "Need to reference ISensorType",
+          "search": "using System.Text.Json.Serialization;\n\nnamespace MyApp.Models",
+          "replace": "using System.Text.Json.Serialization;\nusing MyApp.Interfaces;\n\nnamespace MyApp.Models",
+          "add_imports": ["MyApp.Interfaces"]
+        },
+        {
+          "what": "Change property type from SensorType to ISensorType",
+          "why": "Use the abstraction instead of concrete type",
+          "search": "    [JsonPropertyName(\"sensorType\")]\n    public SensorType Type { get; init; } = null!;\n\n    [JsonPropertyName(\"value\")]",
+          "replace": "    [JsonPropertyName(\"sensorType\")]\n    public ISensorType Type { get; init; } = null!;\n\n    [JsonPropertyName(\"value\")]",
+          "add_imports": []
+        }
+      ]
+    },
+    {
+      "path": "Models/SensorType.cs",
+      "changes": [
+        {
+          "what": "Add interface implementation",
+          "why": "SensorType must implement ISensorType for the abstraction to work",
+          "search": "namespace MyApp.Models\n{\n    public class SensorType",
+          "replace": "using MyApp.Interfaces;\n\nnamespace MyApp.Models\n{\n    public class SensorType : ISensorType",
+          "add_imports": ["MyApp.Interfaces"]
+        }
+      ]
+    }
+  ],
+  "suggested_order": [
+    "1. Create Interfaces/ISensorType.cs - establishes the abstraction layer",
+    "2. Modify Models/SensorType.cs - implement the interface",
+    "3. Modify Models/Sensor.cs - change to use ISensorType instead of SensorType"
+  ],
+  "risks_and_notes": [
+    "Verify that all properties of SensorType used by Sensor are in ISensorType",
+    "Check for any reflection or serialization code that might need updating",
+    "Other files referencing Sensor.Type may need to change from SensorType to ISensorType"
+  ],
+  "confidence": "high"
+}
+```
+
+---
+
+## Final Reminders
+
+1. **Be specific** - Don't just say "change the type", show the exact code
+2. **Be honest** - If you're unsure, say so in `risks_and_notes` and set lower confidence
+3. **Be helpful** - Explain WHY each change is needed
+4. **Be exact** - The `search` text must match exactly, or clearly indicate it's approximate
+
+Output ONLY the JSON. No additional commentary.

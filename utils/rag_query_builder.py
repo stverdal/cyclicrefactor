@@ -484,10 +484,59 @@ class RAGQueryBuilder:
             )
         
         # Check for truncated files
-        truncated_markers = ["...", "[truncated]", "/* lines", "// lines"]
+        # Note: Be careful with "..." as it's used for spread operators in JS/TS
+        # Look for patterns that indicate intentional truncation, not code syntax
+        def _is_truncated(content: str) -> bool:
+            """Check if file content appears to be intentionally truncated."""
+            if not content:
+                return False
+            content_lower = content.lower()
+            
+            # Clear truncation markers
+            if "[truncated]" in content_lower:
+                return True
+            if "/* lines" in content_lower or "// lines" in content_lower:
+                return True
+            if "... (omitted)" in content_lower or "...omitted" in content_lower:
+                return True
+            if "/* ... */" in content or "// ..." in content:
+                # Comment with ellipsis - likely truncation
+                return True
+            
+            # Check for "..." but exclude common code patterns
+            # Spread operator: ...identifier, ...(, ...[
+            # String literal: "...", '...'
+            if "..." in content:
+                # Count occurrences that look like truncation markers vs spread operators
+                import re
+                # Spread operator patterns: ...word, ...(, ...[, ...{
+                spread_pattern = r'\.\.\.[a-zA-Z_(\[{]'
+                spread_count = len(re.findall(spread_pattern, content))
+                
+                # Truncation patterns: standalone "...", at end of line, in comments
+                truncation_pattern = r'(?:^|\s)\.\.\.\s*(?:$|\n)|//\s*\.\.\.|/\*\s*\.\.\.\s*\*/'
+                truncation_count = len(re.findall(truncation_pattern, content, re.MULTILINE))
+                
+                # If more truncation markers than spread operators, consider truncated
+                if truncation_count > 0 and truncation_count > spread_count:
+                    return True
+            
+            # Check if file ends abruptly (mid-statement)
+            stripped = content.rstrip()
+            if stripped.endswith(',') and not stripped.endswith('},'):
+                # Ends with comma but not closing an object - might be truncated
+                lines = stripped.split('\n')
+                if len(lines) > 10:  # Only flag if file is substantial
+                    # Check if it's inside a function/class (unbalanced braces)
+                    open_braces = content.count('{') - content.count('}')
+                    if open_braces > 1:  # More than 1 unclosed brace suggests truncation
+                        return True
+            
+            return False
+        
         truncated_files = [
             f.get("path", "unknown") for f in files 
-            if any(m in f.get("content", "").lower() for m in truncated_markers)
+            if _is_truncated(f.get("content", ""))
         ]
         if len(truncated_files) >= len(files) * 0.5:  # More than half truncated
             return (

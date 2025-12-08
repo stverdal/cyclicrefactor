@@ -1,0 +1,53 @@
+# Suggestion Mode (Compact) - Refactoring Proposal
+
+You are a refactoring expert. Propose changes for human review.
+
+## Cycle: {id}
+Graph: {graph}
+Files: {files}
+
+## Description
+{description}
+
+## Strategy: {strategy}
+
+## Source Code
+{file_snippets}
+
+---
+
+## Output JSON Format
+
+```json
+{
+  "summary": "<1-2 sentence overview>",
+  "strategy_used": "<interface_extraction|dependency_inversion|shared_module|other>",
+  "why_this_breaks_the_cycle": "<explanation>",
+  "new_files": [
+    {"path": "path/to/NewFile.ext", "purpose": "<why needed>", "content": "<full content>"}
+  ],
+  "modifications": [
+    {
+      "path": "path/to/file.ext",
+      "changes": [
+        {
+          "what": "<brief description>",
+          "why": "<reason>",
+          "search": "<EXACT text to find - 3+ lines context>",
+          "replace": "<replacement text>"
+        }
+      ]
+    }
+  ],
+  "suggested_order": ["1. Create X", "2. Modify Y"],
+  "confidence": "<high|medium|low>"
+}
+```
+
+## Rules
+1. COPY search text EXACTLY from Source Code above
+2. Include 3+ lines of context in search
+3. Preserve exact whitespace
+4. Explain WHAT and WHY for each change
+
+Output ONLY the JSON.

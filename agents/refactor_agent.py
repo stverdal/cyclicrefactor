@@ -43,9 +43,15 @@ from utils.minimal_diff import (
 from utils.roadmap_builder import (
     RoadmapBuilder, classify_failure, build_roadmap_from_results
 )
+from utils.suggestion_builder import (
+    build_suggestion_report, enrich_with_context
+)
+from utils.light_validator import (
+    validate_suggestions, add_validation_to_report
+)
 from models.schemas import (
     CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, 
-    RevertedFile, RefactorRoadmap, ScaffoldFile, PartialAttempt
+    RevertedFile, RefactorRoadmap, ScaffoldFile, PartialAttempt, SuggestionReport
 )
 from config import RefactorConfig
 import json
@@ -357,6 +363,183 @@ After:
         
         logger.info(f"Minimal diff complete: {len(patches)} patches, strategy={result.strategy}")
         return AgentResult(status="success", output=proposal.model_dump())
+
+    def _run_suggestion_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+    ) -> AgentResult:
+        """Run suggestion mode - outputs human-reviewable suggestions without applying patches.
+        
+        This mode:
+        1. Uses a special prompt optimized for suggestion output
+        2. Builds suggestions with line numbers and context
+        3. Performs light semantic validation (no strict syntax checks)
+        4. Outputs a markdown-friendly report for review
+        
+        Returns:
+            AgentResult with SuggestionReport as output
+        """
+        logger.info("Running in SUGGESTION MODE")
+        
+        # Build file snippets with full-file priority
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        # Calculate budget for file content - give more budget since we're not applying patches
+        file_budget = int(self.context_window * 0.5 * 4)  # 50% of context, ~4 chars/token
+        
+        if self.refactor_config.prioritize_full_files:
+            file_snippets, file_status = build_file_snippets_with_priority(
+                files_dict,
+                cycle_dict,
+                file_budget,
+                prioritize_full=True,
+                max_chars_per_file=self.refactor_config.full_file_max_chars,
+                full_file_budget_pct=self.refactor_config.full_file_budget_pct,
+            )
+            full_count = sum(1 for s in file_status.values() if s == 'full')
+            logger.info(f"File priority: {full_count}/{len(file_status)} files included in full")
+        else:
+            snippets = []
+            for f in cycle_spec.files:
+                snippet = select_relevant_snippet(f.content or "", f.path, cycle_dict, self.max_file_chars)
+                snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+            file_snippets = "\n\n".join(snippets)
+        
+        # Extract strategy hint from description
+        strategy = self._extract_strategy_from_description(description)
+        
+        # Get RAG context
+        rag_context = self._get_rag_context(cycle_spec, strategy, description)
+        
+        # Get pattern example
+        pattern_example = self._get_pattern_example(strategy)
+        
+        # Load suggestion mode prompt
+        suggestion_template = load_template("prompts/prompt_suggestion.txt")
+        if suggestion_template:
+            prompt_text = safe_format(
+                suggestion_template,
+                id=cycle_spec.id,
+                graph=json.dumps(cycle_spec.graph.model_dump()),
+                files=", ".join(cycle_spec.get_file_paths()),
+                description=description.text,
+                file_snippets=file_snippets,
+                rag_context=rag_context or "(no reference materials available)",
+                pattern_example=pattern_example,
+                strategy=strategy or "not specified - choose the most appropriate",
+            )
+        else:
+            # Fallback inline prompt
+            prompt_text = self._build_suggestion_prompt_fallback(
+                cycle_spec, description, file_snippets, strategy, pattern_example
+            )
+        
+        logger.debug(f"Built suggestion prompt with {len(prompt_text)} chars")
+        
+        try:
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "suggestion_mode",
+                prompt_text,
+                context={"cycle_id": cycle_spec.id, "mode": "suggestion"}
+            )
+            
+            llm_start = datetime.now()
+            llm_response = call_llm(self.llm, prompt_text)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(llm_response) if isinstance(llm_response, str) else json.dumps(llm_response)
+            log_llm_response(
+                "refactor", "suggestion_mode",
+                llm_response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
+            logger.debug(f"LLM response received: {len(response_str)} chars")
+            
+            # Build suggestion report from LLM response
+            context_lines = self.refactor_config.suggestion_context_lines
+            report = build_suggestion_report(
+                cycle_spec=cycle_dict,
+                llm_response=response_str,
+                strategy=strategy,
+                context_lines=context_lines,
+            )
+            
+            # Add validation
+            report = add_validation_to_report(report, cycle_spec)
+            
+            # Enrich with surrounding context from source files
+            report = enrich_with_context(report, files_dict, context_lines)
+            
+            logger.info(f"Suggestion mode complete: {len(report.suggestions)} suggestions, "
+                       f"cycle_will_be_broken={report.cycle_will_be_broken}, "
+                       f"valid={report.validation.is_valid if report.validation else 'not validated'}")
+            
+            # Output as markdown or JSON based on config
+            output_format = self.refactor_config.suggestion_output_format
+            if output_format == "markdown":
+                output = {
+                    "mode": "suggestion",
+                    "markdown": report.to_markdown(),
+                    "report": report.model_dump(),
+                }
+            else:
+                output = {
+                    "mode": "suggestion",
+                    "report": report.model_dump(),
+                }
+            
+            return AgentResult(status="success", output=output)
+            
+        except Exception as e:
+            logger.error(f"Suggestion mode failed: {e}", exc_info=True)
+            return AgentResult(status="error", output=None, logs=f"Suggestion mode failed: {e}")
+    
+    def _build_suggestion_prompt_fallback(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+        file_snippets: str,
+        strategy: Optional[str],
+        pattern_example: str,
+    ) -> str:
+        """Build fallback suggestion prompt if template not found."""
+        return f"""You are an expert software engineer. Propose refactoring changes for human review.
+
+## Cycle Information
+- ID: {cycle_spec.id}
+- Graph: {json.dumps(cycle_spec.graph.model_dump())}
+- Files: {', '.join(cycle_spec.get_file_paths())}
+
+## Problem Description
+{description.text}
+
+## Recommended Strategy: {strategy or 'Choose the most appropriate'}
+
+{pattern_example}
+
+## Source Code
+{file_snippets}
+
+## Task
+Output a JSON with:
+- summary: overview of the refactoring approach
+- strategy_used: the strategy you're using
+- why_this_breaks_the_cycle: explanation
+- new_files: array of new files to create (path, purpose, content)
+- modifications: array of file changes (path, changes array with what/why/search/replace)
+- suggested_order: implementation order
+- risks_and_notes: things to verify
+- confidence: high/medium/low
+
+For `search` text, include 3+ lines of context. Be specific about WHAT and WHY for each change.
+Output ONLY the JSON.
+"""
 
     def _run_scaffolding_mode(
         self,
@@ -1178,39 +1361,8 @@ Output ONLY the complete file content, no JSON wrapper. Start directly with the 
         
         logger.info(f"RefactorAgent completed: {changed}/{len(patches)} files changed, {reverted} reverted (atomic={atomic_proposal})")
         
-        # Build roadmap if in roadmap mode
-        roadmap = None
-        if self.refactor_config.roadmap_mode:
-            patch_results = []
-            for p in patches:
-                patch_results.append({
-                    "path": p.path,
-                    "original": p.original,
-                    "patched": p.patched,
-                    "diff": p.diff,
-                    "status": p.status,
-                    "warnings": p.warnings,
-                    "confidence": p.confidence,
-                    "revert_reason": p.revert_reason,
-                    "validation_issues": p.validation_issues,
-                })
-            
-            scaffold_data = None
-            if scaffold_result:
-                scaffold_data = {
-                    "files_created": scaffold_result.files_created,
-                    "validation_errors": scaffold_result.validation_errors,
-                }
-            
-            roadmap = self._build_roadmap_output(
-                cycle_spec=cycle_spec,
-                strategy=strategy,
-                patch_results=patch_results,
-                scaffold_result=scaffold_result,
-                llm_responses=llm_responses,
-            )
-            logger.info(f"Roadmap generated: {len(roadmap.successful_patches)} success, "
-                       f"{len(roadmap.partial_attempts)} partial")
+        # Note: Roadmap building is done in the calling method that has full context
+        # (cycle_spec, scaffold_result, llm_responses, etc.)
         
         proposal = RefactorProposal(
             patches=patches,
@@ -1221,9 +1373,6 @@ Output ONLY the complete file content, no JSON wrapper. Start directly with the 
         
         # Include roadmap in output if generated
         output = proposal.model_dump()
-        if roadmap:
-            output["roadmap"] = roadmap.model_dump()
-            output["executive_summary"] = roadmap.executive_summary
         
         return AgentResult(status="success", output=output)
 
@@ -2265,6 +2414,11 @@ public class Foo : INewInterface
         # =====================================================================
         # Mode Selection: Check for special modes before standard processing
         # =====================================================================
+        
+        # Suggestion mode - output suggestions for human review without applying patches
+        if self.refactor_config.suggestion_mode and self.llm is not None and validator_feedback is None:
+            logger.info("Using SUGGESTION MODE")
+            return self._run_suggestion_mode(cycle_spec, description)
         
         # Minimal diff mode - focus on single smallest change
         if self.refactor_config.minimal_diff_mode and self.llm is not None and validator_feedback is None:

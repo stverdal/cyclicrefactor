@@ -59,6 +59,10 @@ class RefactorConfig(BaseModel):
     # Simple format mode - use line-based format instead of JSON for very small LLMs
     simple_format_mode: bool = False    # If True, use simple line-based format for 7B and smaller
     auto_simple_threshold: int = 8      # Auto-enable simple format if model size (B) <= this
+    # Suggestion mode - output suggestions for human review instead of applying patches
+    suggestion_mode: bool = False       # If True, output suggestions without applying patches
+    suggestion_context_lines: int = 7   # Number of context lines to include around changes
+    suggestion_output_format: str = "markdown"  # Output format: "markdown" or "json"
 
 
 class IOConfig(BaseModel):

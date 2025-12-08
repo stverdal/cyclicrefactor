@@ -530,3 +530,178 @@ class AnalysisResult(BaseModel):
         if isinstance(v, list):
             return [DetectedCycle(**c) if isinstance(c, dict) else c for c in v]
         return v
+
+
+# =============================================================================
+# Suggestion Mode - Human-reviewable refactoring suggestions
+# =============================================================================
+
+
+class CodeChange(BaseModel):
+    """A single code change within a suggestion."""
+    line_start: int = 0
+    line_end: int = 0
+    original_code: str = ""
+    suggested_code: str = ""
+    change_type: str = "modify"  # "modify", "add", "remove"
+
+
+class RefactorSuggestion(BaseModel):
+    """A single refactoring suggestion with context and explanation."""
+    file_path: str
+    title: str = ""  # Brief title like "Add interface implementation"
+    explanation: str = ""  # Why this change is needed
+    
+    # For new files
+    is_new_file: bool = False
+    new_file_content: str = ""
+    
+    # For modifications to existing files
+    changes: List[CodeChange] = Field(default_factory=list)
+    
+    # Context for humans
+    context_before: str = ""  # Lines before the change area
+    context_after: str = ""   # Lines after the change area
+    
+    # Validation status
+    confidence: float = 1.0  # 0-1 confidence this will work
+    validation_notes: List[str] = Field(default_factory=list)
+    
+    @field_validator("changes", mode="before")
+    @classmethod
+    def convert_change_dicts(cls, v):
+        if isinstance(v, list):
+            return [CodeChange(**c) if isinstance(c, dict) else c for c in v]
+        return v
+
+
+class SuggestionValidation(BaseModel):
+    """Light validation results for suggestion mode."""
+    is_valid: bool = True
+    cycle_logically_broken: bool = False
+    types_exist: bool = True  # All referenced types exist in source or suggestions
+    no_hallucinations_detected: bool = True
+    warnings: List[str] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+
+
+class SuggestionReport(BaseModel):
+    """Complete suggestion report - the output of suggestion mode."""
+    cycle_id: str = ""
+    strategy: str = ""
+    strategy_rationale: str = ""
+    
+    # Overall assessment
+    confidence: float = 0.0
+    cycle_will_be_broken: bool = False
+    
+    # The suggestions themselves
+    suggestions: List[RefactorSuggestion] = Field(default_factory=list)
+    
+    # Light validation
+    validation: Optional[SuggestionValidation] = None
+    
+    # Execution order recommendation
+    suggested_order: List[str] = Field(default_factory=list)  # File paths in order
+    
+    # Human notes
+    notes: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    
+    # Raw LLM output for debugging
+    llm_response: str = ""
+    
+    @field_validator("suggestions", mode="before")
+    @classmethod
+    def convert_suggestion_dicts(cls, v):
+        if isinstance(v, list):
+            return [RefactorSuggestion(**s) if isinstance(s, dict) else s for s in v]
+        return v
+    
+    def to_markdown(self) -> str:
+        """Generate a markdown report for human review."""
+        lines = [
+            f"# Refactoring Suggestions for Cycle: {self.cycle_id}",
+            "",
+            "## Summary",
+            f"**Strategy:** {self.strategy}",
+            f"**Rationale:** {self.strategy_rationale}",
+            f"**Confidence:** {self.confidence:.0%}",
+            f"**Cycle will be broken:** {'✓ Yes' if self.cycle_will_be_broken else '✗ Needs verification'}",
+            "",
+        ]
+        
+        # Validation status
+        if self.validation:
+            lines.append("## Validation")
+            if self.validation.cycle_logically_broken:
+                lines.append("- ✓ Cycle logically broken by these changes")
+            if self.validation.types_exist:
+                lines.append("- ✓ All referenced types exist")
+            if self.validation.no_hallucinations_detected:
+                lines.append("- ✓ No hallucinations detected")
+            for warning in self.validation.warnings:
+                lines.append(f"- ⚠️ {warning}")
+            for error in self.validation.errors:
+                lines.append(f"- ❌ {error}")
+            lines.append("")
+        
+        # Suggested order
+        if self.suggested_order:
+            lines.append("## Recommended Order")
+            for i, path in enumerate(self.suggested_order, 1):
+                lines.append(f"{i}. `{path}`")
+            lines.append("")
+        
+        # Each suggestion
+        for i, suggestion in enumerate(self.suggestions, 1):
+            lines.append("---")
+            lines.append(f"## Suggestion {i}: {suggestion.title}")
+            lines.append("")
+            lines.append(f"**File:** `{suggestion.file_path}`")
+            lines.append("")
+            lines.append(f"**Explanation:** {suggestion.explanation}")
+            lines.append("")
+            
+            if suggestion.is_new_file:
+                lines.append("### New File Content")
+                lines.append("```")
+                lines.append(suggestion.new_file_content)
+                lines.append("```")
+            else:
+                for change in suggestion.changes:
+                    if change.line_start > 0:
+                        lines.append(f"**Location:** Lines {change.line_start}-{change.line_end}")
+                    lines.append("")
+                    lines.append("**Current Code:**")
+                    lines.append("```")
+                    lines.append(change.original_code)
+                    lines.append("```")
+                    lines.append("")
+                    lines.append("**Suggested Change:**")
+                    lines.append("```")
+                    lines.append(change.suggested_code)
+                    lines.append("```")
+            
+            if suggestion.validation_notes:
+                lines.append("")
+                lines.append("**Notes:**")
+                for note in suggestion.validation_notes:
+                    lines.append(f"- {note}")
+            
+            lines.append("")
+        
+        # Warnings and notes
+        if self.warnings:
+            lines.append("---")
+            lines.append("## Warnings")
+            for warning in self.warnings:
+                lines.append(f"- ⚠️ {warning}")
+            lines.append("")
+        
+        if self.notes:
+            lines.append("## Additional Notes")
+            for note in self.notes:
+                lines.append(f"- {note}")
+        
+        return "\n".join(lines)
