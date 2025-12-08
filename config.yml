@@ -2,13 +2,13 @@ llm:
   provider: none
   model: ""
   params:
-    num_ctx: 4096
+    num_ctx: 16384
     temperature: 0.0
 
 # Context management settings
 context:
   # Total context window size (tokens) - should match your LLM's limit
-  window_size: 4096
+  window_size: 16384
   # Per-file character limits (used as fallback if budget system not active)
   max_file_chars: 4000
   max_diff_chars: 6000
@@ -22,10 +22,10 @@ refactor:
   allow_low_confidence: false # Accept matches below min_confidence?
   atomic_mode: true           # All SEARCH/REPLACE blocks must succeed
   atomic_proposal: true       # All files must succeed or all reverted
-  compact_prompts: false      # Use shorter prompts for low-VRAM LLMs
+  compact_prompts: true       # Use shorter prompts for low-VRAM LLMs
   auto_compact_threshold: 8192  # Auto-enable compact if context below this
   # Sequential file mode - two-phase approach for better results
-  sequential_file_mode: false   # If true: plan first, then patch each file separately
+  sequential_file_mode: true    # If true: plan first, then patch each file separately
   auto_sequential_threshold: 3  # Auto-enable if cycle has >= N files
   # Auto-repair settings
   auto_repair_syntax: true      # Attempt to auto-repair syntax errors in LLM output
