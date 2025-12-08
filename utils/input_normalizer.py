@@ -44,7 +44,21 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
     cycle = None
     project_root = None
 
-    if isinstance(raw, dict) and "cycles" in raw and isinstance(raw["cycles"], list):
+    # Handle case where raw input is a list (array of cycles without wrapper)
+    if isinstance(raw, list):
+        logger.info(f"Input is a bare list of {len(raw)} cycle(s)")
+        cycles = raw
+        if cycle_id:
+            cycle = next((c for c in cycles if isinstance(c, dict) and c.get("id") == cycle_id), None)
+            if cycle:
+                logger.info(f"Selected cycle by ID: {cycle_id}")
+            else:
+                logger.warning(f"Cycle ID '{cycle_id}' not found, available IDs: {[c.get('id') for c in cycles if isinstance(c, dict)]}")
+        if cycle is None and cycles:
+            cycle = cycles[0] if isinstance(cycles[0], dict) else None
+            if cycle:
+                logger.info(f"Using first cycle: {cycle.get('id', 'unknown')}")
+    elif isinstance(raw, dict) and "cycles" in raw and isinstance(raw["cycles"], list):
         cycles = raw["cycles"]
         logger.info(f"Input contains {len(cycles)} cycle(s)")
         if cycle_id:
@@ -61,9 +75,12 @@ def normalize_input(raw: Dict[str, Any], cycle_id: Optional[str] = None, read_fi
         project_root = project_info.get("root")
         if project_root:
             logger.debug(f"Project root: {project_root}")
-    else:
+    elif isinstance(raw, dict):
         cycle = raw
         logger.debug("Input is a single cycle object")
+    else:
+        logger.error(f"Unexpected input type: {type(raw)}")
+        raise ValueError(f"Unexpected input type: {type(raw)}, expected dict or list")
 
     if cycle is None:
         logger.error("No cycle found in input JSON")
