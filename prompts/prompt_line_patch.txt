@@ -1,6 +1,6 @@
 You are refactoring code to break a cyclic dependency.
 
-TASK: Break the cycle in a minimal, safe way by modifying ONE file.
+TASK: Break the cycle by modifying files or creating new interface/abstraction files.
 
 CYCLE TO BREAK:
 {cycle}
@@ -15,7 +15,7 @@ AVAILABLE DEPENDENCY PATTERNS (copy these exactly if adding imports):
 
 === OUTPUT FORMAT ===
 
-Respond with JSON containing line-based patches:
+Respond with JSON containing line-based patches AND any new files:
 
 ```json
 {
@@ -30,7 +30,14 @@ Respond with JSON containing line-based patches:
         }
       ],
       "add_at_line": 1,
-      "add_content": "import { X } from './newLocation';"
+      "add_content": "import { IService } from './IService';"
+    }
+  ],
+  "new_files": [
+    {
+      "path": "path/to/IService.ts",
+      "content": "export interface IService {\n  methodName(): void;\n}",
+      "purpose": "Interface extracted from Service class to break cycle"
     }
   ],
   "reasoning": "Brief explanation of the refactoring approach"
@@ -44,13 +51,38 @@ RULES:
 4. ALWAYS include replacement code in "new_content" - do NOT leave it empty unless deleting a single import line
 5. Sort multiple changes by line number for clarity
 6. Preserve indentation in new_content
-7. Only modify the target file
-8. NEVER delete multiple lines without replacement - refactoring should REPLACE code, not delete it
+7. NEVER delete multiple lines without replacement - refactoring should REPLACE code, not delete it
+8. For interface extraction: create a new_files entry with the interface, then modify existing files to import and use it
 
 COMMON PATTERNS:
 - Move an import from direct to lazy: change lines with the import
-- Extract interface: add import at top, change lines using the concrete type
+- Extract interface: CREATE a new interface file in new_files, ADD import at top, CHANGE class to implement interface
 - Inject dependency: modify constructor lines and add parameter
+- Dependency inversion: create interface file, make concrete class implement it, depend on interface instead
+
+Example for INTERFACE EXTRACTION (recommended for breaking cycles):
+```json
+{
+  "patches": [{
+    "path": "src/service.ts",
+    "changes": [{
+      "lines": [1, 1],
+      "new_content": "import { IDependency } from './IDependency';",
+      "description": "Import the new interface instead of concrete class"
+    }, {
+      "lines": [5, 5],
+      "new_content": "  private dep: IDependency;",
+      "description": "Use interface type instead of concrete"
+    }]
+  }],
+  "new_files": [{
+    "path": "src/IDependency.ts",
+    "content": "export interface IDependency {\n  doThing(data: string): void;\n}",
+    "purpose": "Interface extracted to break cycle between Service and Dependency"
+  }],
+  "reasoning": "Extracted interface IDependency to break direct dependency cycle"
+}
+```
 
 Example for replacing a direct import with a lazy one:
 ```json

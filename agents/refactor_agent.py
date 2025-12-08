@@ -896,6 +896,34 @@ Ensure your line numbers are exact and match the numbered content below.
                         status="unchanged",
                     ))
             
+            # Handle new files from LLM response (for interface extraction)
+            try:
+                import json as json_mod
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_str)
+                if json_match:
+                    data = json_mod.loads(json_match.group(1))
+                    new_files = data.get("new_files", [])
+                    if new_files:
+                        logger.info(f"Found {len(new_files)} new file(s) to create (interface extraction)")
+                        for nf in new_files:
+                            new_path = nf.get("path", "")
+                            new_content = nf.get("content", "")
+                            purpose = nf.get("purpose", "New file for refactoring")
+                            if new_path and new_content:
+                                patches.append(Patch(
+                                    path=new_path,
+                                    original="",
+                                    patched=new_content,
+                                    diff=f"+++ {new_path}\n{new_content[:500]}..." if len(new_content) > 500 else f"+++ {new_path}\n{new_content}",
+                                    status="new_file",
+                                    confidence=1.0,
+                                ))
+                                logger.info(f"Created new file: {new_path} ({purpose})")
+                            else:
+                                logger.warning(f"Skipping new file with missing path or content: {nf}")
+            except Exception as e:
+                logger.debug(f"Could not parse new_files from response: {e}")
+            
             # Extract reasoning from response
             reasoning = ""
             try:
@@ -914,7 +942,8 @@ Ensure your line numbers are exact and match the numbered content below.
             )
             
             applied_count = sum(1 for p in patches if p.status == "applied")
-            logger.info(f"Line-patch mode complete: {applied_count}/{len(patches)} files patched")
+            new_file_count = sum(1 for p in patches if p.status == "new_file")
+            logger.info(f"Line-patch mode complete: {applied_count} files patched, {new_file_count} new files created")
             
             return AgentResult(status="success", output=proposal.model_dump())
             
@@ -951,7 +980,7 @@ Ensure your line numbers are exact and match the numbered content below.
 
 ## Output Format
 
-Respond with JSON containing line-based patches:
+Respond with JSON containing line-based patches AND any new files to create:
 
 ```json
 {{
@@ -966,7 +995,14 @@ Respond with JSON containing line-based patches:
         }}
       ],
       "add_at_line": 1,
-      "add_content": "import {{ X }} from './newLocation';"
+      "add_content": "import {{ IService }} from './IService';"
+    }}
+  ],
+  "new_files": [
+    {{
+      "path": "path/to/IService.ext",
+      "content": "interface content here",
+      "purpose": "Interface extracted to break cycle"
     }}
   ],
   "reasoning": "Brief explanation"
@@ -979,6 +1015,7 @@ RULES:
 3. For insertions, use "add_at_line" and "add_content"
 4. Include all replaced lines' content in "new_content"
 5. Preserve indentation
+6. For interface extraction: create interface in new_files array, update existing file to use it
 """
 
     def _run_simple_format_mode(
