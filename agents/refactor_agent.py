@@ -372,6 +372,140 @@ After:
         logger.info(f"Minimal diff complete: {len(patches)} patches, strategy={result.strategy}")
         return AgentResult(status="success", output=proposal.model_dump())
 
+    def _run_relaxed_suggestion_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+    ) -> AgentResult:
+        """Run relaxed suggestion mode - simple prompt, human-readable output, no strict parsing.
+        
+        This mode:
+        1. Uses a simple, readable prompt
+        2. Returns LLM output as-is (human-readable text/code)
+        3. Skips strict validation - partial code blocks with "...other code..." are fine
+        4. Saves output for human review without any parsing or patching
+        
+        Returns:
+            AgentResult with the raw LLM suggestion as output
+        """
+        logger.info("Running in RELAXED SUGGESTION MODE (simple prompt, no strict validation)")
+        
+        # Build file snippets - include as much context as possible
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        # Give generous budget for file content
+        file_budget = int(self.context_window * 0.5 * 4)  # 50% of context, ~4 chars/token
+        
+        # Build numbered snippets for context
+        numbered_snippets, line_counts = build_numbered_file_snippets(
+            files_dict,
+            max_chars_per_file=file_budget // max(len(files_dict), 1),
+        )
+        
+        logger.info(f"Built numbered snippets for {len(line_counts)} files")
+        
+        # Load relaxed prompt template
+        prompt_template = load_template("prompts/prompt_relaxed_suggestion.txt")
+        if prompt_template:
+            prompt_text = safe_format(
+                prompt_template,
+                cycle_id=cycle_spec.id,
+                files=", ".join(cycle_spec.get_file_paths()),
+                description=description.text[:2000] if len(description.text) > 2000 else description.text,
+                file_snippets=numbered_snippets,
+            )
+        else:
+            # Fallback inline prompt
+            prompt_text = f"""Analyze this cyclic dependency and suggest how to break it.
+
+CYCLE: {cycle_spec.id}
+FILES: {', '.join(cycle_spec.get_file_paths())}
+
+PROBLEM:
+{description.text[:2000] if len(description.text) > 2000 else description.text}
+
+CODE:
+{numbered_snippets}
+
+Provide your analysis and suggested code changes in plain, readable format.
+You can use partial code snippets with "... existing code ..." for context.
+"""
+        
+        logger.debug(f"Built relaxed suggestion prompt with {len(prompt_text)} chars")
+        
+        try:
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "relaxed_suggestion",
+                prompt_text,
+                context={"cycle_id": cycle_spec.id, "mode": "relaxed_suggestion"}
+            )
+            
+            llm_start = datetime.now()
+            llm_response = call_llm(self.llm, prompt_text)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(llm_response) if isinstance(llm_response, str) else json.dumps(llm_response)
+            log_llm_response(
+                "refactor", "relaxed_suggestion",
+                llm_response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
+            logger.info(f"LLM response received: {len(response_str)} chars")
+            
+            # Build output - no parsing, just return the suggestion as-is
+            output = {
+                "mode": "relaxed_suggestion",
+                "cycle_id": cycle_spec.id,
+                "files": cycle_spec.get_file_paths(),
+                "description_summary": description.text[:500] if description.text else "",
+                "suggestion": response_str,
+                "llm_response_length": len(response_str),
+                "skip_validation": getattr(self.refactor_config, 'relaxed_skip_validation', True),
+            }
+            
+            # Also create a simple markdown report for easy reading
+            markdown_report = f"""# Relaxed Suggestion Report
+
+## Cycle: {cycle_spec.id}
+
+### Files Involved
+{chr(10).join(f"- {f}" for f in cycle_spec.get_file_paths())}
+
+### Problem Summary
+{description.text[:1000] if description.text else "No description"}
+
+---
+
+## LLM Suggestion
+
+{response_str}
+
+---
+
+*Generated in relaxed suggestion mode - no strict validation applied*
+"""
+            output["markdown_report"] = markdown_report
+            
+            logger.info("Relaxed suggestion mode complete - returning raw LLM output for human review")
+            return AgentResult(
+                status="success",
+                output=output,
+                logs=f"Relaxed suggestion generated: {len(response_str)} chars"
+            )
+            
+        except Exception as e:
+            logger.error(f"Relaxed suggestion mode failed: {e}")
+            return AgentResult(
+                status="error",
+                output=None,
+                logs=f"Relaxed suggestion mode failed: {str(e)}"
+            )
+
     def _run_suggestion_mode(
         self,
         cycle_spec: CycleSpec,
@@ -3020,6 +3154,12 @@ public class Foo : INewInterface
         # =====================================================================
         # Mode Selection: Check for special modes before standard processing
         # =====================================================================
+        
+        # Relaxed suggestion mode - simple prompt, human-readable output, no strict parsing
+        # This is the simplest mode - just get LLM suggestions and save them
+        if getattr(self.refactor_config, 'relaxed_suggestion_mode', False) and self.llm is not None and validator_feedback is None:
+            logger.info("Using RELAXED SUGGESTION MODE")
+            return self._run_relaxed_suggestion_mode(cycle_spec, description)
         
         # Suggestion mode - output suggestions for human review without applying patches
         # Only on first run (no validator feedback) since suggestions don't need retries

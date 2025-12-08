@@ -420,6 +420,45 @@ The cycle between **{node_list}** could not be automatically broken.
                     return results
                 
                 refactor_elapsed = time.time() - refactor_start
+                
+                # Check if this is a relaxed suggestion mode output (skip validation)
+                is_relaxed_suggestion = (
+                    isinstance(ref_result.output, dict) and 
+                    ref_result.output.get("mode") == "relaxed_suggestion"
+                )
+                
+                if is_relaxed_suggestion:
+                    skip_validation = ref_result.output.get("skip_validation", True)
+                    logger.info(f"Relaxed suggestion mode detected (skip_validation={skip_validation})")
+                    
+                    # Save the markdown report
+                    try:
+                        markdown_report = ref_result.output.get("markdown_report", "")
+                        if markdown_report:
+                            self.persistor.save_text(artifact_id, "suggestion/relaxed_suggestion.md", markdown_report)
+                            logger.info(f"Saved relaxed suggestion report to suggestion/relaxed_suggestion.md")
+                        
+                        # Also save the raw suggestion
+                        raw_suggestion = ref_result.output.get("suggestion", "")
+                        if raw_suggestion:
+                            self.persistor.save_text(artifact_id, "suggestion/raw_suggestion.txt", raw_suggestion)
+                    except Exception as e:
+                        logger.warning(f"Failed to persist relaxed suggestion: {e}")
+                    
+                    if skip_validation:
+                        logger.info("Skipping validation for relaxed suggestion mode")
+                        results["status"] = "relaxed_suggestion"
+                        results["iterations"] = iteration
+                        
+                        pipeline_elapsed = time.time() - pipeline_start
+                        logger.info("="*50)
+                        logger.info(f"PIPELINE COMPLETE: {artifact_id} (RELAXED SUGGESTION)")
+                        logger.info("="*50)
+                        logger.info(f"Total time: {pipeline_elapsed:.1f}s")
+                        logger.info(f"Output saved to: {self.config.io.artifacts_dir}/{artifact_id}/suggestion/")
+                        
+                        return results
+                
                 if ref_result.output and isinstance(ref_result.output, dict):
                     patches = ref_result.output.get("patches", [])
                     changed = len([p for p in patches if p.get("diff")])

@@ -1,0 +1,78 @@
+# Relaxed Suggestion Mode - Human-Readable Output
+
+You are analyzing a cyclic dependency and suggesting how to break it.
+
+## Cycle Information
+- ID: {cycle_id}
+- Files involved: {files}
+
+## Problem Description
+{description}
+
+## Current Code
+{file_snippets}
+
+---
+
+## Your Task
+
+Analyze the cycle and suggest how to break it. Write your response in plain, readable text.
+
+### What to include:
+
+1. **Analysis**: Briefly explain what creates the cycle and why it's problematic.
+
+2. **Recommended Strategy**: Name the approach (e.g., "Extract Interface", "Move to Shared Module", "Lazy Import", etc.)
+
+3. **Code Changes**: Show the key code changes needed. You can use:
+   - Complete code blocks for small changes
+   - Partial snippets with `... existing code ...` for context
+   - Just the relevant lines that need to change
+
+### Example format:
+
+```
+ANALYSIS:
+The cycle exists because AuthService imports UserService, and UserService imports AuthService.
+The coupling is due to AuthService.validateUser() calling UserService.getUser().
+
+STRATEGY: Extract Interface
+
+CHANGES:
+
+1. Create new file: src/interfaces/IUserProvider.ts
+```typescript
+export interface IUserProvider {
+    getUser(id: string): Promise<User>;
+}
+```
+
+2. Modify AuthService.ts - change the import and type:
+```typescript
+import { IUserProvider } from '../interfaces/IUserProvider';
+
+class AuthService {
+    constructor(private userProvider: IUserProvider) { }
+    
+    ... existing code ...
+    
+    async validateUser(id: string) {
+        const user = await this.userProvider.getUser(id);
+        ... existing validation logic ...
+    }
+}
+```
+
+3. Modify UserService.ts - implement the interface:
+```typescript
+import { IUserProvider } from '../interfaces/IUserProvider';
+
+class UserService implements IUserProvider {
+    ... existing code ...
+}
+```
+```
+
+---
+
+Now analyze the cycle and provide your suggestions:
