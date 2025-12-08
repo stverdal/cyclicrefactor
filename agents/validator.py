@@ -801,10 +801,40 @@ You must analyze the code changes (diffs) below to determine whether they succes
             logger.debug(f"LLM decision: {parsed.get('decision', 'unknown')}")
 
             # Merge rule-based issues with parsed issues
-            parsed_issues = [
-                ValidationIssue.model_validate(i) if isinstance(i, dict) else i
-                for i in parsed.get("issues", [])
-            ]
+            # Sanitize parsed issues from LLM before validating with Pydantic.
+            # LLMs sometimes emit nulls for optional fields (e.g., path=null) which
+            # would raise during strict model validation. Coerce/normalize fields
+            # to safe defaults to avoid crashing the validator.
+            parsed_issues = []
+            for i in parsed.get("issues", []):
+                if isinstance(i, dict):
+                    sanitized = dict(i)  # shallow copy
+                    # Ensure path is a string (coerce None -> empty string)
+                    p = sanitized.get("path")
+                    sanitized["path"] = "" if p is None else str(p)
+                    # Ensure comment exists
+                    if sanitized.get("comment") is None:
+                        sanitized["comment"] = ""
+                    # Ensure severity and issue_type have defaults
+                    if sanitized.get("severity") is None:
+                        sanitized["severity"] = "major"
+                    if sanitized.get("issue_type") is None:
+                        sanitized["issue_type"] = "semantic"
+
+                    try:
+                        parsed_issues.append(ValidationIssue.model_validate(sanitized))
+                    except Exception as ve:
+                        logger.warning(f"Failed to validate parsed issue, falling back to safe defaults: {ve}")
+                        # Fallback: construct a minimal ValidationIssue without raising
+                        parsed_issues.append(ValidationIssue(
+                            path=sanitized.get("path", ""),
+                            line=sanitized.get("line"),
+                            comment=sanitized.get("comment", ""),
+                            severity=sanitized.get("severity", "major"),
+                            issue_type=sanitized.get("issue_type", "semantic"),
+                        ))
+                else:
+                    parsed_issues.append(i)
             all_issues = rule_issues + parsed_issues
             
             # Categorize all issues by severity

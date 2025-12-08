@@ -693,12 +693,85 @@ The cycle between **{node_list}** could not be automatically broken.
                     run_metadata={"artifact_id": artifact_id, "iterations": iteration, "max_iterations": self.max_iterations},
                     config=self.config.model_dump() if hasattr(self.config, 'model_dump') else None,
                 )
-                # Attach the log report and a short narrative to the explanation
+                # Attach the log report to the explanation
                 failure_explanation["log_report"] = log_report
-                # If the failure_explanation has no markdown, add the narrative as markdown
+
+                # If the failure_explanation has no markdown, build a detailed markdown report
                 if isinstance(failure_explanation, dict):
                     if not failure_explanation.get("markdown_report"):
-                        failure_explanation["markdown_report"] = "".join(["# Failure Narrative\n", log_report.get("narrative", "")])
+                        md_lines = []
+                        md_lines.append(f"# Failure Report — {artifact_id}\n")
+                        # Short summary
+                        narrative = log_report.get("narrative") or {}
+                        summary = narrative.get("summary") if isinstance(narrative, dict) else (narrative or "No summary available")
+                        md_lines.append(f"**Summary:** {summary}\n")
+
+                        # Description excerpt
+                        desc = log_report.get("description_excerpt") or (description.text if hasattr(description, 'text') else (description.get('text') if isinstance(description, dict) else ""))
+                        if desc:
+                            md_lines.append("**Description (excerpt):**\n")
+                            md_lines.append("```\n" + str(desc) + "\n```")
+
+                        # Attempts / iterations
+                        if attempt_summaries:
+                            md_lines.append("**Attempts / Iterations:**\n")
+                            for i, a in enumerate(attempt_summaries, start=1):
+                                md_lines.append(f"- Iteration {i}: {a}")
+                            md_lines.append("\n")
+
+                        # Run metadata
+                        rm = log_report.get("run_metadata") or {}
+                        if rm:
+                            md_lines.append("**Run metadata:**\n")
+                            md_lines.append(f"- artifact_id: {rm.get('artifact_id', artifact_id)}")
+                            md_lines.append(f"- iterations: {rm.get('iterations', 'unknown')}")
+                            md_lines.append("\n")
+
+                        # Patch summary
+                        ps = log_report.get("patch_summary") or {}
+                        if ps:
+                            md_lines.append("**Patch summary:**\n")
+                            md_lines.append(f"- total patches: {ps.get('total', 0)}")
+                            md_lines.append(f"- new files created: {ps.get('new_files', 0)}")
+                            md_lines.append(f"- failed patches: {ps.get('failed_count', 0)}")
+                            md_lines.append("\n")
+
+                        # Top validation issues
+                        tvi = log_report.get("top_validation_issues") or []
+                        if tvi:
+                            md_lines.append("**Top validation issues:**\n")
+                            for iv in tvi[:5]:
+                                md_lines.append(f"- {iv.get('path','unknown')}:{iv.get('line','?')} — {iv.get('comment','no comment')} ({iv.get('issue_type','')})")
+                            md_lines.append("\n")
+
+                        # Evidence / log snippets
+                        snippets = log_report.get("log_snippets") or []
+                        if snippets:
+                            md_lines.append("**Relevant log snippets:**\n")
+                            for s in snippets[:10]:
+                                md_lines.append(f"- {s}")
+                            md_lines.append("\n")
+
+                        # Narrative details
+                        if isinstance(narrative, dict):
+                            md_lines.append("**Detailed narrative:**\n")
+                            md_lines.append(f"**What we tried:**\n")
+                            for w in narrative.get('what_we_tried', []):
+                                md_lines.append(f"- {w}")
+                            md_lines.append(f"\n**Evidence:**\n")
+                            for e in narrative.get('evidence', [])[:8]:
+                                md_lines.append(f"- {e}")
+                            md_lines.append(f"\n**Probable causes:**\n")
+                            for c in narrative.get('probable_causes', []):
+                                md_lines.append(f"- {c}")
+                            md_lines.append(f"\n**Recommended next steps:**\n")
+                            for n in narrative.get('next_steps', []):
+                                md_lines.append(f"- {n}")
+                        else:
+                            md_lines.append("**Narrative:**\n")
+                            md_lines.append(str(narrative))
+
+                        failure_explanation["markdown_report"] = "\n".join(md_lines)
             except Exception as e:
                 logger.debug(f"Could not build log-based failure report: {e}")
 
