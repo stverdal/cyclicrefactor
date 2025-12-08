@@ -232,7 +232,8 @@ Examples:
     cfg = load_config(args.config)
 
     # Configure logging from config (or override with CLI arg)
-    log_config = cfg.logging.copy() if cfg.logging else {}
+    # Convert Pydantic model to dict for configure_from_config
+    log_config = cfg.logging.model_dump() if cfg.logging else {}
     if args.log_level:
         log_config["level"] = args.log_level
     logger = configure_from_config(log_config)
