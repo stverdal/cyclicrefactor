@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, Union, List
+from datetime import datetime
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.snippet_selector import select_relevant_snippet
@@ -6,10 +7,11 @@ from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, QueryIntent, CycleAnalysis
 from utils.context_budget import (
-    ContextBudget, BudgetCategory, TokenEstimator,
+    BudgetCategory, TokenEstimator,
     prioritize_cycle_files, get_file_budget, create_budget_for_agent,
     truncate_to_token_budget
 )
+from utils.llm_logger import log_llm_call, log_llm_response
 from models.schemas import CycleSpec, CycleDescription
 import json
 
@@ -343,8 +345,32 @@ Pattern: {analysis.dominant_pattern}
 
         try:
             logger.info("Calling LLM for cycle description")
+            
+            # Log LLM input
+            call_id = log_llm_call(
+                "describer", "describe",
+                prompt_text,
+                context={
+                    "cycle_id": cycle_spec.id,
+                    "num_files": len(cycle_spec.files),
+                    "cycle_type": analysis.cycle_type.value
+                }
+            )
+            
+            llm_start = datetime.now()
             response = call_llm(self.llm, prompt_text)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
             text = response if isinstance(response, str) else json.dumps(response)
+            
+            # Log LLM output
+            log_llm_response(
+                "describer", "describe",
+                response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
             logger.debug(f"LLM response length: {len(text)} chars")
             
             # Try to parse structured response

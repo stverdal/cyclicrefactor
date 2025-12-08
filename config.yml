@@ -27,6 +27,13 @@ refactor:
   # Sequential file mode - two-phase approach for better results
   sequential_file_mode: false   # If true: plan first, then patch each file separately
   auto_sequential_threshold: 3  # Auto-enable if cycle has >= N files
+  # Auto-repair settings
+  auto_repair_syntax: true      # Attempt to auto-repair syntax errors in LLM output
+  auto_repair_min_confidence: 0.6  # Minimum confidence to accept auto-repair
+  # Validation settings
+  rule_based_validation: true   # Run rule-based validation (set false to skip)
+  block_on_validation_failure: true  # Reject patches that fail validation
+  hallucination_detection: true # Detect and warn about LLM hallucinations
 
 io:
   artifacts_dir: artifacts
@@ -76,3 +83,11 @@ validator:
 logging:
   level: INFO
   log_file: langCodeUnderstanding.log
+  console: true
+  # LLM input/output logging (for debugging and analysis)
+  log_llm_io: true            # Log all LLM prompts and responses
+  llm_io_log_file: llm_io.log # Separate file for LLM I/O logs
+  log_llm_prompts: true       # Log full prompts sent to LLM
+  log_llm_responses: true     # Log full LLM responses
+  truncate_llm_logs: 0        # Max chars per log entry (0 = no truncation)
+  log_llm_timestamps: true    # Include timestamps in LLM logs

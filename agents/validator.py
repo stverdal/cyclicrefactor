@@ -1,16 +1,18 @@
 from typing import Dict, Any, List, Optional, Union, Set, Tuple
+from datetime import datetime
 import json
 import re
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
-from utils.rag_query_builder import RAGQueryBuilder, QueryIntent
+from utils.rag_query_builder import RAGQueryBuilder
 from utils.syntax_checker import (
     check_bracket_balance, check_truncation, validate_code_block,
     ValidationResult, SyntaxIssue, SyntaxIssueType
 )
 from utils.cycle_verifier import verify_cycle_broken, CycleVerificationResult
+from utils.llm_logger import log_llm_call, log_llm_response
 from models.schemas import (
     CycleSpec,
     CycleDescription,
@@ -704,8 +706,32 @@ class ValidatorAgent(Agent):
 
         try:
             logger.info("Calling LLM for semantic validation")
+            
+            # Log LLM input
+            call_id = log_llm_call(
+                "validator", "validate",
+                prompt,
+                context={
+                    "cycle_id": cycle_spec.id,
+                    "num_patches": len(proposal.patches),
+                    "files_changed": len([p for p in proposal.patches if p.diff])
+                }
+            )
+            
+            llm_start = datetime.now()
             response = call_llm(self.llm, prompt)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
             text = response if isinstance(response, str) else json.dumps(response)
+            
+            # Log LLM output
+            log_llm_response(
+                "validator", "validate",
+                response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
             parsed = self._parse_llm_response(text)
             logger.debug(f"LLM decision: {parsed.get('decision', 'unknown')}")
 

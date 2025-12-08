@@ -1,13 +1,14 @@
 from typing import Dict, Any, List, Optional, Union, Tuple
 from dataclasses import dataclass, field
+from datetime import datetime
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
 from utils.snippet_selector import select_relevant_snippet
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
-from utils.rag_query_builder import RAGQueryBuilder, QueryIntent, CycleAnalysis
+from utils.rag_query_builder import RAGQueryBuilder, QueryIntent
 from utils.context_budget import (
-    ContextBudget, BudgetCategory, TokenEstimator,
+    BudgetCategory, TokenEstimator,
     prioritize_cycle_files, get_file_budget, create_budget_for_agent,
     truncate_to_token_budget
 )
@@ -15,6 +16,7 @@ from utils.syntax_checker import (
     validate_code_block, check_truncation, check_introduced_issues,
     get_common_indent, normalize_line_endings, SyntaxIssue
 )
+from utils.syntax_repair import auto_repair_syntax, should_attempt_repair, RepairResult
 from utils.compile_checker import CompileChecker, CompileResult
 from utils.patch_parser import (
     parse_json_patches, parse_marker_patches, parse_search_replace_json,
@@ -27,6 +29,9 @@ from utils.patch_applier import (
 from utils.diff_utils import (
     make_unified_diff, looks_truncated, validate_patched_content,
     check_for_truncation, get_common_indent as diff_get_common_indent
+)
+from utils.llm_logger import (
+    log_llm_call, log_llm_response, log_llm_summary, LLMCallTracker
 )
 from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, RevertedFile
 from config import RefactorConfig
@@ -49,6 +54,15 @@ class CompileCheckInfo:
 
 
 @dataclass
+class AutoRepairInfo:
+    """Information about auto-repair attempts."""
+    attempted: bool = False
+    was_repaired: bool = False
+    repairs_made: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+
+@dataclass
 class PatchProcessingResult:
     """Result of processing a single file patch."""
     path: str
@@ -66,6 +80,7 @@ class PatchProcessingResult:
     has_critical_error: bool  # True if critical syntax/validation error found
     original_patched: Optional[str]  # Content before revert (if reverted)
     compile_info: Optional[CompileCheckInfo] = None  # Compile/lint check results
+    repair_info: Optional[AutoRepairInfo] = None  # Auto-repair info
 
 
 class RefactorAgent(Agent):
@@ -454,14 +469,42 @@ Include 3+ lines of context in each SEARCH block.
         """
         logger.info("Running in SEQUENTIAL FILE MODE")
         
+        # Track LLM call stats
+        total_prompt_chars = 0
+        total_response_chars = 0
+        llm_call_count = 0
+        start_time = datetime.now()
+        
         # Phase 1: Planning
         logger.info("Phase 1: Generating refactoring plan...")
         plan_prompt = self._build_planning_prompt(cycle_spec, description)
         logger.debug(f"Planning prompt: {len(plan_prompt)} chars")
         
         try:
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "planning",
+                plan_prompt,
+                context={"cycle_id": cycle_spec.id, "num_files": len(cycle_spec.files)}
+            )
+            total_prompt_chars += len(plan_prompt)
+            llm_call_count += 1
+            
+            plan_start = datetime.now()
             plan_response = call_llm(self.llm, plan_prompt)
-            logger.debug(f"Plan response: {len(str(plan_response))} chars")
+            plan_duration = (datetime.now() - plan_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(plan_response)
+            log_llm_response(
+                "refactor", "planning",
+                plan_response,
+                call_id=call_id,
+                duration_ms=plan_duration
+            )
+            total_response_chars += len(response_str)
+            
+            logger.debug(f"Plan response: {len(response_str)} chars")
             
             # Parse the plan
             plan = self._parse_plan_response(plan_response)
@@ -500,8 +543,29 @@ Include 3+ lines of context in each SEARCH block.
                 # Generate content for new file
                 new_file_prompt = self._build_new_file_prompt(new_file, plan)
                 try:
+                    # Log LLM call for new file
+                    call_id = log_llm_call(
+                        "refactor", "new_file",
+                        new_file_prompt,
+                        context={"new_file": new_path}
+                    )
+                    total_prompt_chars += len(new_file_prompt)
+                    llm_call_count += 1
+                    
+                    file_start = datetime.now()
                     new_file_response = call_llm(self.llm, new_file_prompt)
-                    llm_responses.append(str(new_file_response))
+                    file_duration = (datetime.now() - file_start).total_seconds() * 1000
+                    
+                    response_str = str(new_file_response)
+                    log_llm_response(
+                        "refactor", "new_file",
+                        new_file_response,
+                        call_id=call_id,
+                        duration_ms=file_duration
+                    )
+                    total_response_chars += len(response_str)
+                    
+                    llm_responses.append(response_str)
                     new_content = self._parse_new_file_response(new_file_response)
                     if new_content:
                         all_inferred.append({
@@ -539,9 +603,30 @@ Include 3+ lines of context in each SEARCH block.
             logger.debug(f"Per-file prompt: {len(file_prompt)} chars")
             
             try:
+                # Log LLM call for this file
+                call_id = log_llm_call(
+                    "refactor", "file_patch",
+                    file_prompt,
+                    context={"file_path": file_path, "file_num": execution_order.index(file_path) + 1}
+                )
+                total_prompt_chars += len(file_prompt)
+                llm_call_count += 1
+                
+                file_start = datetime.now()
                 file_response = call_llm(self.llm, file_prompt)
-                llm_responses.append(str(file_response))
-                logger.debug(f"File response: {len(str(file_response))} chars")
+                file_duration = (datetime.now() - file_start).total_seconds() * 1000
+                
+                response_str = str(file_response)
+                log_llm_response(
+                    "refactor", "file_patch",
+                    file_response,
+                    call_id=call_id,
+                    duration_ms=file_duration
+                )
+                total_response_chars += len(response_str)
+                
+                llm_responses.append(response_str)
+                logger.debug(f"File response: {len(response_str)} chars")
                 
                 # Parse the per-file response
                 file_patches = self._parse_per_file_response(file_response, file_path)
@@ -1316,6 +1401,85 @@ public class Foo : INewInterface
         """
         return infer_patches(llm_response, cycle_files)
 
+    def _validate_inferred_patches(
+        self, 
+        inferred: List[Dict[str, Any]], 
+        strategy_used: str = ""
+    ) -> None:
+        """Validate inferred patches for common LLM issues.
+        
+        Checks for:
+        1. No-op patches (search == replace)
+        2. Interface extraction without creating interface
+        3. Hallucinated type references
+        
+        Logs warnings but doesn't block - patches may still be applied.
+        Respects hallucination_detection config setting.
+        
+        Args:
+            inferred: List of inferred patch dictionaries
+            strategy_used: The strategy the LLM claimed to use
+        """
+        # Skip if hallucination detection is disabled
+        if not self.refactor_config.hallucination_detection:
+            logger.debug("Hallucination detection disabled in config, skipping validation")
+            return
+        
+        from utils.syntax_checker import (
+            detect_noop_patch, 
+            validate_interface_extraction,
+            detect_hallucinated_types
+        )
+        
+        # Check for no-op patches
+        noop_count = 0
+        for patch in inferred:
+            sr_list = patch.get("search_replace", [])
+            for sr in sr_list:
+                search = sr.get("search", "")
+                replace = sr.get("replace", "")
+                if detect_noop_patch(search, replace):
+                    noop_count += 1
+                    logger.warning(
+                        f"No-op patch detected in {patch.get('path', 'unknown')}: "
+                        f"search == replace (first 50 chars: '{search[:50]}...')"
+                    )
+        
+        if noop_count > 0:
+            logger.warning(f"Found {noop_count} no-op patches that will have no effect")
+        
+        # Validate interface extraction strategy
+        if strategy_used:
+            is_valid, warnings = validate_interface_extraction(inferred, strategy_used)
+            for warning in warnings:
+                logger.error(f"Strategy validation failed: {warning}")
+        
+        # Check for hallucinated types
+        all_sr = []
+        for patch in inferred:
+            all_sr.extend(patch.get("search_replace", []))
+        
+        hallucinated = detect_hallucinated_types(all_sr)
+        if hallucinated:
+            logger.error(
+                f"Possible hallucinated interface types detected: {hallucinated}. "
+                "These types are introduced but may not be defined anywhere. "
+                "Check if new_files contains the interface definitions."
+            )
+            
+            # Check if any new files define these interfaces
+            new_file_contents = ""
+            for patch in inferred:
+                if patch.get("is_new_file"):
+                    new_file_contents += patch.get("patched", "") + "\n"
+            
+            undefined = [h for h in hallucinated if h not in new_file_contents]
+            if undefined:
+                logger.error(
+                    f"CRITICAL: Interface types {undefined} are used but never defined! "
+                    "The LLM is hallucinating interface extraction without creating interfaces."
+                )
+
     def _make_unified_diff(self, original: str, patched: str, path: str) -> str:
         """Generate a unified diff. Delegates to utils.diff_utils."""
         return make_unified_diff(original, patched, path)
@@ -1565,6 +1729,7 @@ public class Foo : INewInterface
         # Pre-validate patched content
         pre_validated = False
         validation_issues: List[str] = []
+        repair_info = AutoRepairInfo()
         
         if patched != original:
             validation_result = validate_code_block(patched, path, original)
@@ -1577,15 +1742,57 @@ public class Foo : INewInterface
                 else:
                     logger.warning(f"Patch Validation [{path}]: {issue.message}")
             
-            # Check for critical issues
-            if validation_result.has_critical:
-                has_critical_error = True
-                revert_reason = "; ".join(i.message for i in validation_result.issues if i.severity == "critical")
-                original_patched = patched  # Save what we tried
-                # Log detailed failure info at DEBUG level
-                self._log_failed_patch_details(
-                    path, original, patched_entry, patch_warnings + validation_issues, revert_reason
+            # Attempt auto-repair if enabled and there are critical issues
+            if (validation_result.has_critical and 
+                self.refactor_config.auto_repair_syntax and
+                should_attempt_repair(validation_result.issues)):
+                
+                logger.info(f"Attempting auto-repair for {path}...")
+                repair_result = auto_repair_syntax(patched, path)
+                repair_info = AutoRepairInfo(
+                    attempted=True,
+                    was_repaired=repair_result.was_repaired,
+                    repairs_made=repair_result.repairs_made,
+                    confidence=repair_result.confidence
                 )
+                
+                if repair_result.was_repaired:
+                    logger.info(f"Auto-repair successful for {path}: {repair_result}")
+                    
+                    # Check if repair meets confidence threshold
+                    if repair_result.confidence >= self.refactor_config.auto_repair_min_confidence:
+                        # Re-validate the repaired content
+                        patched = repair_result.content
+                        validation_result = validate_code_block(patched, path, original)
+                        validation_issues = [i.message for i in validation_result.issues]
+                        
+                        # Add repair info to warnings
+                        for repair in repair_result.repairs_made:
+                            patch_warnings.append(f"Auto-repair: {repair}")
+                        
+                        logger.info(f"Auto-repair applied (confidence={repair_result.confidence:.0%}), "
+                                   f"re-validation: {len(validation_result.issues)} issues remaining")
+                    else:
+                        logger.warning(f"Auto-repair confidence too low ({repair_result.confidence:.0%} < "
+                                      f"{self.refactor_config.auto_repair_min_confidence:.0%}), not applying")
+                else:
+                    logger.debug(f"Auto-repair did not find fixable issues for {path}")
+            
+            # Check for critical issues (may have been fixed by auto-repair)
+            if validation_result.has_critical:
+                # Check config: should we block on validation failure?
+                if self.refactor_config.block_on_validation_failure:
+                    has_critical_error = True
+                    revert_reason = "; ".join(i.message for i in validation_result.issues if i.severity == "critical")
+                    original_patched = patched  # Save what we tried
+                    # Log detailed failure info at DEBUG level
+                    self._log_failed_patch_details(
+                        path, original, patched_entry, patch_warnings + validation_issues, revert_reason
+                    )
+                else:
+                    # Log but don't block
+                    logger.warning(f"Critical validation issues in {path} but block_on_validation_failure=False, proceeding")
+                    patch_warnings.append("Validation issues present but not blocking (block_on_validation_failure=False)")
         
         # Compile/lint check (if enabled and no critical errors yet)
         compile_info = CompileCheckInfo()
@@ -1640,6 +1847,7 @@ public class Foo : INewInterface
             has_critical_error=has_critical_error,
             original_patched=original_patched,
             compile_info=compile_info,
+            repair_info=repair_info,
         )
 
     def run(
@@ -1710,8 +1918,33 @@ public class Foo : INewInterface
 
         try:
             logger.info("Calling LLM for refactor proposal")
+            
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "main",
+                prompt_text,
+                context={
+                    "cycle_id": cycle_spec.id,
+                    "num_files": len(cycle_spec.files),
+                    "strategy": strategy,
+                    "has_feedback": validator_feedback is not None
+                }
+            )
+            
+            llm_start = datetime.now()
             llm_response = call_llm(self.llm, prompt_text)
-            logger.debug(f"LLM response received, length: {len(str(llm_response))} chars")
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(llm_response) if isinstance(llm_response, str) else json.dumps(llm_response)
+            log_llm_response(
+                "refactor", "main",
+                llm_response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
+            logger.debug(f"LLM response received, length: {len(response_str)} chars")
 
             # Convert files to dict for _infer_patches compatibility
             files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
@@ -1719,17 +1952,22 @@ public class Foo : INewInterface
             logger.debug(f"Inferred {len(inferred)} patches from LLM response")
 
             # Try to extract strategy from response
+            strategy_used = ""
             try:
                 text = llm_response if isinstance(llm_response, str) else json.dumps(llm_response)
                 json_match = re.search(r'\{[\s\S]*\}', text)
                 if json_match:
                     parsed = json.loads(json_match.group())
                     if "strategy_used" in parsed:
-                        logger.info(f"LLM used strategy: {parsed['strategy_used']}")
+                        strategy_used = parsed['strategy_used']
+                        logger.info(f"LLM used strategy: {strategy_used}")
                     if "reasoning" in parsed:
                         logger.debug(f"LLM reasoning: {parsed['reasoning'][:200]}...")
             except Exception:
                 pass
+
+            # Validate the inferred patches before applying
+            self._validate_inferred_patches(inferred, strategy_used)
 
             # Build final patches list merging originals with patched content
             # Log what patches were inferred for debugging

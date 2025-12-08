@@ -380,3 +380,120 @@ def normalize_line_endings(content: str) -> str:
         Content with consistent LF line endings
     """
     return content.replace('\r\n', '\n').replace('\r', '\n')
+
+
+def detect_noop_patch(search: str, replace: str) -> bool:
+    """Detect if a search/replace pair is a no-op (search == replace).
+    
+    Args:
+        search: The search text
+        replace: The replacement text
+        
+    Returns:
+        True if this is a no-op patch
+    """
+    if not search or not replace:
+        return False
+    
+    # Normalize whitespace for comparison
+    search_normalized = normalize_line_endings(search).strip()
+    replace_normalized = normalize_line_endings(replace).strip()
+    
+    return search_normalized == replace_normalized
+
+
+def validate_interface_extraction(
+    patches: List[Dict], 
+    strategy_used: str = ""
+) -> Tuple[bool, List[str]]:
+    """Validate that interface extraction actually creates an interface.
+    
+    When strategy is interface_extraction, we should see:
+    1. A new file with an interface definition, OR
+    2. An append with interface content
+    
+    Args:
+        patches: List of patch dictionaries
+        strategy_used: The strategy the LLM claimed to use
+        
+    Returns:
+        Tuple of (is_valid, list_of_warnings)
+    """
+    warnings = []
+    
+    # Only validate if strategy is interface_extraction
+    if strategy_used.lower() not in ("interface_extraction", "interface extraction"):
+        return True, []
+    
+    # Check for interface creation
+    has_new_interface = False
+    has_interface_file = False
+    
+    for patch in patches:
+        path = patch.get("path", "").lower()
+        content = patch.get("patched", "") or patch.get("content", "") or ""
+        append_content = patch.get("append", "") or ""
+        is_new_file = patch.get("is_new_file", False)
+        
+        # Check if this is a new interface file
+        if is_new_file and path:
+            if path.startswith("i") or "/i" in path or "interface" in path:
+                has_interface_file = True
+            # Check content for interface definition
+            if "interface " in content or "interface\n" in content:
+                has_new_interface = True
+        
+        # Check append for interface
+        if append_content and "interface " in append_content:
+            has_new_interface = True
+    
+    if not has_new_interface and not has_interface_file:
+        warnings.append(
+            "Interface extraction claimed but no interface was created. "
+            "Expected a new_files entry with an interface definition."
+        )
+        return False, warnings
+    
+    return True, warnings
+
+
+def detect_hallucinated_types(search_replace_list: List[Dict]) -> List[str]:
+    """Detect when LLM replaces types with non-existent interface types.
+    
+    Common hallucination pattern:
+    - Replace "SensorType" with "ISensorType" 
+    - But ISensorType is never defined anywhere
+    
+    Args:
+        search_replace_list: List of {search, replace} dicts
+        
+    Returns:
+        List of potentially hallucinated type names
+    """
+    hallucinated = []
+    
+    # Pattern: introducing an I-prefixed type that wasn't in search
+    for sr in search_replace_list:
+        search = sr.get("search", "")
+        replace = sr.get("replace", "")
+        
+        if not search or not replace:
+            continue
+        
+        # Find type names that appear in replace but not search
+        # Pattern: ITypeName (capital I followed by capital letter)
+        interface_pattern = r'\bI[A-Z][a-zA-Z0-9]*\b'
+        
+        replace_interfaces = set(re.findall(interface_pattern, replace))
+        search_interfaces = set(re.findall(interface_pattern, search))
+        
+        # New interfaces introduced in replace
+        new_interfaces = replace_interfaces - search_interfaces
+        
+        for iface in new_interfaces:
+            # Check if the base type (without I) was in search
+            base_type = iface[1:]  # Remove the I prefix
+            if base_type in search and iface not in search:
+                hallucinated.append(iface)
+    
+    return list(set(hallucinated))

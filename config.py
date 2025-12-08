@@ -37,12 +37,33 @@ class RefactorConfig(BaseModel):
     # Sequential file mode - process files one at a time
     sequential_file_mode: bool = False  # If True, use two-phase approach: plan then per-file execution
     auto_sequential_threshold: int = 3  # Auto-enable sequential mode if cycle has >= this many files
+    # Auto-repair settings
+    auto_repair_syntax: bool = True     # If True, attempt to auto-repair syntax errors in LLM output
+    auto_repair_min_confidence: float = 0.6  # Minimum confidence to accept auto-repair
+    # Validation settings
+    rule_based_validation: bool = True  # If True, run rule-based validation (set False to skip)
+    block_on_validation_failure: bool = True  # If True, reject patches that fail validation
+    hallucination_detection: bool = True  # If True, detect and warn about LLM hallucinations
 
 
 class IOConfig(BaseModel):
     artifacts_dir: str = "artifacts"
     cyclic_folder: str = "cyclicDepen"
     prompts_dir: str = "prompts"
+
+
+class LoggingConfig(BaseModel):
+    """Configuration for enhanced logging."""
+    level: str = "INFO"
+    log_file: str = "langCodeUnderstanding.log"
+    console: bool = True
+    # LLM input/output logging
+    log_llm_io: bool = True          # If True, log LLM inputs and outputs
+    llm_io_log_file: str = "llm_io.log"  # Separate file for LLM I/O logs
+    log_llm_prompts: bool = True     # If True, log full prompts sent to LLM
+    log_llm_responses: bool = True   # If True, log full LLM responses
+    truncate_llm_logs: int = 0       # Max chars to log per prompt/response (0 = no truncation)
+    log_llm_timestamps: bool = True  # If True, include timestamps in LLM logs
 
 
 class PipelineConfig(BaseModel):
@@ -59,9 +80,9 @@ class AppConfig(BaseModel):
     refactor: RefactorConfig = RefactorConfig()
     io: IOConfig = IOConfig()
     pipeline: PipelineConfig = PipelineConfig()
+    logging: LoggingConfig = LoggingConfig()
     auth: Dict[str, str] = {}
     prompts: Dict[str, str] = {}
-    logging: Dict[str, Any] = {}
 
 
 def load_config(path: Optional[str] = None) -> AppConfig:

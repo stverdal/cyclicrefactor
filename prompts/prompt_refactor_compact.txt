@@ -43,9 +43,14 @@ Files: {files}
 4. **NEW FILES** - Use `"new_files": [{{"path": "...", "content": "..."}}]` for new interfaces/classes
 5. **NEW IMPORTS** - Use `"prepend": "using ...;"` to add imports to existing files
 6. **DO NOT search for non-existent text**
+7. **Interface extraction MUST create interface** - Don't just rename types!
 
-❌ BAD: `"search": "public void Method()"`  (no context)
-❌ BAD: `"search": "// Add interface here"` (doesn't exist)
-✅ GOOD: `"new_files": [{{"path": "Interfaces/IFoo.cs", "content": "namespace X {{ interface IFoo {{ }} }}"}}]`
+## ⚠️ AVOID THESE MISTAKES
+
+❌ BAD: `"search": "public SensorType X"` → `"replace": "public ISensorType X"` (ISensorType doesn't exist!)
+❌ BAD: Search equals Replace (no-op patch)
+❌ BAD: Single line with no context
+
+✅ GOOD: Create interface in `new_files` FIRST, then reference it in changes
 
 Output ONLY JSON. No commentary.

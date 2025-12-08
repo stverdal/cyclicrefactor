@@ -88,4 +88,10 @@ Follow the plan exactly. Implement the changes specified for this file.
 {{"search": "    [JsonPropertyName(\"type\")]\n    public SensorType Type {{ get; set; }}\n\n    [JsonPropertyName(\"value\")]", "replace": "..."}}
 ```
 
+## ⚠️ AVOID THESE MISTAKES
+
+❌ **No-op patches** - Don't output patches where search == replace
+❌ **Hallucinated types** - Don't use ISensorType if it doesn't exist yet
+❌ **Missing interface** - If plan says "extract interface", the interface MUST be created in a new_files entry (done in planning phase)
+
 Output ONLY the JSON object for this single file.

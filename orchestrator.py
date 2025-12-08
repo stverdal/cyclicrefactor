@@ -10,6 +10,7 @@ from agents.cycle_detector import CycleDetectorAgent
 from utils.persistence import Persistor
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, UnbreakableReason
+from utils.llm_logger import configure_from_config as configure_llm_logger
 from agents.llm_utils import create_llm_from_config
 from config import AppConfig
 from models.schemas import (
@@ -56,6 +57,22 @@ class Orchestrator:
         )
 
         logger.info("Initializing Orchestrator...")
+        
+        # Configure LLM I/O logging from config
+        if hasattr(self.config, 'logging') and hasattr(self.config.logging, 'log_llm_io'):
+            try:
+                configure_llm_logger({
+                    "log_llm_io": self.config.logging.log_llm_io,
+                    "llm_io_log_file": self.config.logging.llm_io_log_file,
+                    "log_llm_prompts": self.config.logging.log_llm_prompts,
+                    "log_llm_responses": self.config.logging.log_llm_responses,
+                    "truncate_llm_logs": self.config.logging.truncate_llm_logs,
+                    "log_llm_timestamps": self.config.logging.log_llm_timestamps,
+                })
+                if self.config.logging.log_llm_io:
+                    logger.info(f"LLM I/O logging enabled: {self.config.logging.llm_io_log_file}")
+            except Exception as e:
+                logger.warning(f"Failed to configure LLM I/O logging: {e}")
 
         # Create shared LLM client from config
         try:

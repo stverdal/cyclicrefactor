@@ -35,9 +35,11 @@ Which specific import/reference creates the cycle? Look for:
 Based on the recommended strategy:
 
 **If Interface Extraction:**
-- Create a new interface with the methods the dependent class needs
-- Have the original class implement the interface
+- **MUST CREATE** a new interface file in `new_files` array
+- The interface defines the methods the dependent class needs
+- The original class implements the interface
 - Change the dependent to use the interface type
+- ⚠️ DO NOT just rename types (e.g., SensorType → ISensorType) without creating the interface!
 
 **If Dependency Inversion:**
 - Create an abstraction in the higher-level module
@@ -53,6 +55,7 @@ Based on the recommended strategy:
 - Modify ONLY what's necessary to break the cycle
 - Preserve all existing functionality
 - Ensure all imports are correct after changes
+- **VERIFY**: If creating an interface, it MUST be in `new_files`
 
 ---
 
@@ -199,5 +202,31 @@ To add new using/import statements to an EXISTING file:
 2. **Preserve functionality** - Don't change behavior, only structure
 3. **Valid imports** - Ensure all imports work after changes
 4. **Minimal changes** - Only modify what's necessary
+
+## ⚠️ CRITICAL: Avoid These Hallucinations
+
+**❌ WRONG - Renaming without creating interface:**
+```json
+{"search": "public SensorType Type", "replace": "public ISensorType Type"}
+```
+This is WRONG because `ISensorType` doesn't exist! You MUST create it first.
+
+**✅ CORRECT - Create interface THEN use it:**
+```json
+{
+  "new_files": [
+    {"path": "Interfaces/ISensorType.cs", "content": "namespace MyApp.Interfaces { public interface ISensorType { string Name { get; } } }"}
+  ],
+  "changes": [
+    {"path": "Models/Sensor.cs", "prepend": "using MyApp.Interfaces;", "search_replace": [...]}
+  ]
+}
+```
+
+**❌ WRONG - No-op patches (search equals replace):**
+```json
+{"search": "public string Name => Type.Name;", "replace": "public string Name => Type.Name;"}
+```
+This changes nothing! Only include patches that actually modify code.
 
 Output ONLY the JSON or file markers. No additional commentary.
