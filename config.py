@@ -44,6 +44,9 @@ class RefactorConfig(BaseModel):
     rule_based_validation: bool = True  # If True, run rule-based validation (set False to skip)
     block_on_validation_failure: bool = True  # If True, reject patches that fail validation
     hallucination_detection: bool = True  # If True, detect and warn about LLM hallucinations
+    # Validation memory - learn from past validation attempts
+    enable_validation_memory: bool = True  # If True, track and learn from validation history
+    validation_memory_file: str = "cache/validation_memory.json"  # File to store memory
     # === NEW: Advanced Refactoring Modes ===
     # Roadmap mode - outputs detailed progress even on failures (good for demos)
     roadmap_mode: bool = False          # If True, output RefactorRoadmap with partial results

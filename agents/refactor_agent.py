@@ -49,6 +49,7 @@ from utils.suggestion_builder import (
 from utils.light_validator import (
     validate_suggestions, add_validation_to_report
 )
+from utils.validation_memory import get_validation_memory, ValidationMemory
 from utils.line_patch import (
     add_line_numbers, build_numbered_file_snippets, 
     parse_line_patches, apply_line_patches
@@ -771,6 +772,21 @@ Your previous patch attempt had validation issues. Please address these:
 Ensure your line numbers are exact and match the numbered content below.
 """
             logger.info(f"Including {len(feedback_issues)} validation issues in retry prompt")
+            
+            # Add memory-based guidance for retries
+            try:
+                memory = get_validation_memory()
+                memory_guidance = memory.get_retry_guidance(
+                    cycle_spec.id,
+                    [issue.get('issue_type', 'unknown') if isinstance(issue, dict) 
+                     else getattr(issue, 'issue_type', 'unknown') 
+                     for issue in validator_feedback.issues[:5]]
+                )
+                if memory_guidance:
+                    feedback_section += f"\n## Learning from Past Attempts\n{memory_guidance}\n"
+                    logger.info("Added memory-based retry guidance to prompt")
+            except Exception as e:
+                logger.debug(f"Could not add memory guidance: {e}")
         
         # Load line-patch prompt template
         line_patch_template = load_template("prompts/prompt_line_patch.txt")

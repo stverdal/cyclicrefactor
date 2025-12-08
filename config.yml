@@ -45,6 +45,9 @@ refactor:
   rule_based_validation: false  # Run rule-based validation (set false to skip)
   block_on_validation_failure: false  # Reject patches that fail validation
   hallucination_detection: false # Detect and warn about LLM hallucinations
+  # Validation memory - learn from past attempts
+  enable_validation_memory: true  # Track and learn from validation history
+  validation_memory_file: cache/validation_memory.json  # File to store memory
 
 io:
   artifacts_dir: artifacts

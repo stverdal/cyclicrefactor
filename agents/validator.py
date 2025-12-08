@@ -13,6 +13,7 @@ from utils.syntax_checker import (
 )
 from utils.cycle_verifier import verify_cycle_broken, CycleVerificationResult
 from utils.llm_logger import log_llm_call, log_llm_response
+from utils.validation_memory import get_validation_memory, ValidationMemory
 from models.schemas import (
     CycleSpec,
     CycleDescription,
@@ -55,6 +56,7 @@ class ValidatorAgent(Agent):
         max_file_chars: int = 4000,
         rag_service=None,
         refactor_config=None,
+        enable_memory: bool = True,
     ):
         """
         Args:
@@ -65,6 +67,7 @@ class ValidatorAgent(Agent):
             max_file_chars: Truncation limit per file snippet.
             rag_service: Optional RAG service for validation criteria.
             refactor_config: Optional RefactorConfig with validation settings.
+            enable_memory: If True, use validation memory for learning.
         """
         self.llm = llm
         self.prompt_template = prompt_template
@@ -79,9 +82,20 @@ class ValidatorAgent(Agent):
         if refactor_config:
             self.rule_based_validation = getattr(refactor_config, 'rule_based_validation', True)
             self.block_on_validation_failure = getattr(refactor_config, 'block_on_validation_failure', True)
+            self.enable_memory = getattr(refactor_config, 'enable_validation_memory', enable_memory)
         else:
             self.rule_based_validation = True
             self.block_on_validation_failure = True
+            self.enable_memory = enable_memory
+        
+        # Initialize validation memory
+        self.memory: Optional[ValidationMemory] = None
+        if self.enable_memory:
+            try:
+                self.memory = get_validation_memory()
+                logger.info("Validation memory enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize validation memory: {e}")
 
     # -------------------------------------------------------------------------
     # Prompt building
@@ -715,6 +729,10 @@ You must analyze the code changes (diffs) below to determine whether they succes
                 issues=rule_issues,
                 suggestions=suggestions,
             )
+            
+            # Record to memory for learning
+            self._record_to_memory(cycle_spec, proposal, report)
+            
             return AgentResult(status="success", output=report.model_dump())
 
         # LLM-based review
@@ -725,6 +743,29 @@ You must analyze the code changes (diffs) below to determine whether they succes
             prompt += "\n\nPreliminary observations from static analysis:\n"
             for obs in observations:
                 prompt += f"- {obs}\n"
+        
+        # Add memory context if available (helps LLM understand past attempts)
+        if self.memory:
+            try:
+                # Get strategy from proposal rationale
+                strategy = None
+                if proposal.rationale:
+                    rationale_lower = proposal.rationale.lower()
+                    if "interface" in rationale_lower:
+                        strategy = "interface_extraction"
+                    elif "lazy" in rationale_lower:
+                        strategy = "lazy_import"
+                
+                memory_context = self.memory.build_memory_context(
+                    cycle_id=cycle_spec.id,
+                    strategy=strategy,
+                    max_chars=1500,
+                )
+                if memory_context:
+                    prompt += f"\n\n## Validation History (for context)\n{memory_context}\n"
+                    logger.debug("Added memory context to validator prompt")
+            except Exception as e:
+                logger.debug(f"Could not add memory context: {e}")
         
         logger.debug(f"Built validation prompt with {len(prompt)} chars")
 
@@ -792,6 +833,13 @@ You must analyze the code changes (diffs) below to determine whether they succes
                 issues=all_issues,
                 suggestions=llm_suggestions,
             )
+            
+            # Record to memory for learning
+            self._record_to_memory(
+                cycle_spec, proposal, report, 
+                strategy=description.strategy if hasattr(description, 'strategy') else None
+            )
+            
             return AgentResult(status="success", output=report.model_dump())
 
         except Exception as e:
@@ -799,3 +847,64 @@ You must analyze the code changes (diffs) below to determine whether they succes
             return AgentResult(
                 status="error", output=None, logs=f"LLM call failed: {e}"
             )
+    
+    def _record_to_memory(
+        self,
+        cycle_spec: CycleSpec,
+        proposal: RefactorProposal,
+        report: ValidationReport,
+        strategy: str = None,
+    ):
+        """Record validation attempt to memory for learning."""
+        if not self.memory:
+            return
+        
+        try:
+            # Extract strategy from proposal rationale if not provided
+            if not strategy and proposal.rationale:
+                # Try to extract strategy from rationale
+                rationale_lower = proposal.rationale.lower()
+                if "interface" in rationale_lower:
+                    strategy = "interface_extraction"
+                elif "lazy" in rationale_lower:
+                    strategy = "lazy_import"
+                elif "shared" in rationale_lower or "common" in rationale_lower:
+                    strategy = "shared_module"
+                elif "event" in rationale_lower:
+                    strategy = "event_driven"
+                else:
+                    strategy = "unknown"
+            
+            # Build approach summary
+            files_changed = [p.path for p in proposal.patches if p.diff]
+            approach_summary = proposal.rationale[:200] if proposal.rationale else "No rationale provided"
+            
+            # Build diff summary
+            diff_parts = []
+            for p in proposal.patches[:3]:  # First 3 patches
+                if p.diff:
+                    diff_parts.append(f"{p.path}: {len(p.diff)} chars")
+            diff_summary = "; ".join(diff_parts)
+            
+            # Extract issues as dicts
+            issues = []
+            for issue in report.issues:
+                if isinstance(issue, dict):
+                    issues.append(issue)
+                elif hasattr(issue, 'model_dump'):
+                    issues.append(issue.model_dump())
+                else:
+                    issues.append({"comment": str(issue)})
+            
+            self.memory.record_attempt(
+                cycle_id=cycle_spec.id,
+                strategy=strategy or "unknown",
+                files_changed=files_changed,
+                approved=report.approved,
+                issues=issues,
+                suggestions=report.suggestions or [],
+                approach_summary=approach_summary,
+                diff_summary=diff_summary,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record to validation memory: {e}")
