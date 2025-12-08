@@ -163,12 +163,19 @@ def _build_cycle_context(cycle_spec: CycleSpec) -> CycleContext:
         nodes=list(cycle_spec.graph.nodes) if cycle_spec.graph else [],
     )
     
-    # Build edges
+    # Build edges - handle both list format [source, target] and object format
     if cycle_spec.graph and cycle_spec.graph.edges:
-        ctx.edges = [
-            {"source": e.source, "target": e.target}
-            for e in cycle_spec.graph.edges
-        ]
+        ctx.edges = []
+        for e in cycle_spec.graph.edges:
+            if isinstance(e, list) and len(e) >= 2:
+                # Edge is a list like ["source", "target"]
+                ctx.edges.append({"source": e[0], "target": e[1]})
+            elif isinstance(e, dict):
+                # Edge is already a dict
+                ctx.edges.append({"source": e.get("source", ""), "target": e.get("target", "")})
+            elif hasattr(e, "source") and hasattr(e, "target"):
+                # Edge is an object with source/target attributes
+                ctx.edges.append({"source": e.source, "target": e.target})
     
     # Determine cycle type
     node_count = len(ctx.nodes)
