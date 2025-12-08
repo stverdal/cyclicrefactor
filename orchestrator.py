@@ -25,6 +25,7 @@ from models.schemas import (
 from rag.rag_service import RAGService
 import time
 import json
+from utils.failure_report import build_failure_report
 
 logger = get_logger("orchestrator")
 
@@ -677,7 +678,27 @@ The cycle between **{node_list}** could not be automatically broken.
                     validation_history,
                     unbreakable_reason,
                 )
-            
+
+            # Augment failure explanation with log-based report (human readable)
+            try:
+                log_report = build_failure_report(
+                    artifact_dir=self.config.io.artifacts_dir,
+                    artifact_id=artifact_id,
+                    cycle_id=cycle_spec.id,
+                    last_proposal=last_proposal,
+                    last_validation=last_validation,
+                    validation_history=validation_history,
+                    config=self.config.model_dump() if hasattr(self.config, 'model_dump') else None,
+                )
+                # Attach the log report and a short narrative to the explanation
+                failure_explanation["log_report"] = log_report
+                # If the failure_explanation has no markdown, add the narrative as markdown
+                if isinstance(failure_explanation, dict):
+                    if not failure_explanation.get("markdown_report"):
+                        failure_explanation["markdown_report"] = "".join(["# Failure Narrative\n", log_report.get("narrative", "")])
+            except Exception as e:
+                logger.debug(f"Could not build log-based failure report: {e}")
+
             results["explanation"] = failure_explanation
             
             # Persist failure explanation
