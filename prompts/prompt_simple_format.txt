@@ -1,0 +1,42 @@
+Break this cyclic dependency by modifying the code.
+
+CYCLE: {cycle_id}
+FILES: {files}
+
+{description}
+
+STRATEGY HINT: {strategy}
+
+{file_snippets}
+
+=== OUTPUT FORMAT ===
+
+Use this EXACT text format (not JSON):
+
+STRATEGY: <name of strategy>
+REASONING: <one sentence explanation>
+
+For each change to an existing file:
+
+FILE: <path/to/file.ext>
+CHANGE: lines <start>-<end>
+---
+<replacement code>
+---
+DESCRIPTION: <what this does>
+
+For new files:
+
+NEW_FILE: <path/to/new/file.ext>
+---
+<complete file content>
+---
+
+=== RULES ===
+1. Use EXACT line numbers from snippets above
+2. Put code between --- markers
+3. Include complete replacement (not partial)
+4. One CHANGE block per location
+5. Preserve indentation
+
+Generate the changes now:

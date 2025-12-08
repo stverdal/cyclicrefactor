@@ -49,6 +49,14 @@ from utils.suggestion_builder import (
 from utils.light_validator import (
     validate_suggestions, add_validation_to_report
 )
+from utils.line_patch import (
+    add_line_numbers, build_numbered_file_snippets, 
+    parse_line_patches, apply_line_patches
+)
+from utils.simple_format import (
+    build_simple_format_prompt, parse_simple_format,
+    convert_simple_to_line_patches, should_use_simple_format
+)
 from models.schemas import (
     CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, 
     RevertedFile, RefactorRoadmap, ScaffoldFile, PartialAttempt, SuggestionReport
@@ -543,6 +551,422 @@ Output a JSON with:
 For `search` text, include 3+ lines of context. Be specific about WHAT and WHY for each change.
 Output ONLY the JSON.
 """
+
+    def _run_line_patch_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+    ) -> AgentResult:
+        """Run line-based patching mode - uses line numbers instead of SEARCH/REPLACE.
+        
+        This mode:
+        1. Includes line numbers in file snippets
+        2. Asks LLM to output patches with line ranges
+        3. Applies patches by line number (more reliable than text matching)
+        
+        Benefits:
+        - No fuzzy text matching needed
+        - Works even with whitespace differences
+        - Better error messages with exact line numbers
+        - Handles partial LLM output gracefully
+        
+        Returns:
+            AgentResult with RefactorProposal
+        """
+        logger.info("Running in LINE-BASED PATCH MODE")
+        
+        # Build file dicts with content
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        # Calculate budget for file content
+        file_budget = int(self.context_window * 0.45 * 4)  # 45% of context, ~4 chars/token
+        
+        # Build numbered file snippets
+        numbered_snippets, line_counts = build_numbered_file_snippets(
+            files_dict,
+            max_chars_per_file=file_budget // max(len(files_dict), 1),
+        )
+        
+        logger.info(f"Built numbered snippets for {len(line_counts)} files")
+        for path, count in line_counts.items():
+            logger.debug(f"  {path}: {count} lines")
+        
+        # Extract strategy hint from description
+        strategy = self._extract_strategy_from_description(description)
+        
+        # Get pattern example (brief for this mode)
+        pattern_example = self._get_pattern_example(strategy)
+        
+        # Load line-patch prompt template
+        line_patch_template = load_template("prompts/prompt_line_patch.txt")
+        if line_patch_template:
+            prompt_text = safe_format(
+                line_patch_template,
+                cycle=json.dumps({
+                    "id": cycle_spec.id,
+                    "nodes": cycle_spec.graph.nodes,
+                    "edges": cycle_spec.graph.edges,
+                }),
+                target_file=cycle_spec.files[0].path if cycle_spec.files else "unknown",
+                patterns=pattern_example,
+                file_content=numbered_snippets,
+            )
+        else:
+            # Fallback inline prompt
+            prompt_text = self._build_line_patch_prompt_fallback(
+                cycle_spec, description, numbered_snippets, strategy, pattern_example
+            )
+        
+        # Enforce prompt budget
+        prompt_text = self._enforce_prompt_budget(prompt_text, numbered_snippets, cycle_spec.get_file_paths())
+        
+        logger.debug(f"Built line-patch prompt with {len(prompt_text)} chars")
+        
+        try:
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "line_patch_mode",
+                prompt_text,
+                context={"cycle_id": cycle_spec.id, "mode": "line_patch"}
+            )
+            
+            llm_start = datetime.now()
+            llm_response = call_llm(self.llm, prompt_text)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(llm_response) if isinstance(llm_response, str) else json.dumps(llm_response)
+            log_llm_response(
+                "refactor", "line_patch_mode",
+                llm_response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
+            logger.debug(f"LLM response received: {len(response_str)} chars")
+            
+            # Parse line-based patches from response
+            raw_patches = parse_line_patches(response_str)
+            logger.info(f"Parsed {len(raw_patches)} file patch(es) from LLM response")
+            
+            # Apply patches and build results
+            patches = []
+            for f in cycle_spec.files:
+                # Find matching patch for this file
+                file_patch = None
+                for p in raw_patches:
+                    patch_path = p.get("path", "")
+                    if patch_path == f.path or f.path.endswith(patch_path.split('/')[-1]):
+                        file_patch = p
+                        break
+                
+                original = f.content or ""
+                
+                if file_patch:
+                    # Apply line-based patches
+                    result = apply_line_patches(original, [file_patch])
+                    patched = result.content
+                    
+                    if result.success and result.applied_count > 0:
+                        diff = self._make_unified_diff(original, patched, f.path)
+                        patches.append(Patch(
+                            path=f.path,
+                            original=original,
+                            patched=patched,
+                            diff=diff,
+                            status="applied",
+                            confidence=1.0,
+                            applied_blocks=result.applied_count,
+                            total_blocks=result.total_count,
+                            warnings=result.warnings,
+                        ))
+                        logger.info(f"Applied {result.applied_count} line patch(es) to {f.path}")
+                    else:
+                        # Failed to apply
+                        patches.append(Patch(
+                            path=f.path,
+                            original=original,
+                            patched=original,
+                            diff="",
+                            status="failed",
+                            confidence=0.0,
+                            warnings=result.errors + result.warnings,
+                        ))
+                        logger.warning(f"Failed to apply line patches to {f.path}: {result.errors}")
+                else:
+                    # No patch for this file
+                    patches.append(Patch(
+                        path=f.path,
+                        original=original,
+                        patched=original,
+                        diff="",
+                        status="unchanged",
+                    ))
+            
+            # Extract reasoning from response
+            reasoning = ""
+            try:
+                import json as json_mod
+                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_str)
+                if json_match:
+                    data = json_mod.loads(json_match.group(1))
+                    reasoning = data.get("reasoning", "")
+            except:
+                pass
+            
+            proposal = RefactorProposal(
+                patches=patches,
+                rationale=f"Line-based patching: {reasoning or strategy or 'applied changes by line number'}",
+                llm_response=response_str,
+            )
+            
+            applied_count = sum(1 for p in patches if p.status == "applied")
+            logger.info(f"Line-patch mode complete: {applied_count}/{len(patches)} files patched")
+            
+            return AgentResult(status="success", output=proposal.model_dump())
+            
+        except Exception as e:
+            logger.error(f"Line-patch mode failed: {e}", exc_info=True)
+            return AgentResult(status="error", output=None, logs=f"Line-patch mode failed: {e}")
+    
+    def _build_line_patch_prompt_fallback(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+        numbered_snippets: str,
+        strategy: Optional[str],
+        pattern_example: str,
+    ) -> str:
+        """Build fallback line-patch prompt if template not found."""
+        return f"""You are refactoring code to break a cyclic dependency.
+
+## Cycle Information
+- ID: {cycle_spec.id}
+- Nodes: {', '.join(cycle_spec.graph.nodes)}
+- Edges: {json.dumps(cycle_spec.graph.edges)}
+
+## Problem Description
+{description.text}
+
+## Recommended Strategy: {strategy or 'Choose the most appropriate'}
+
+{pattern_example}
+
+## Source Code (with line numbers)
+{numbered_snippets}
+
+## Output Format
+
+Respond with JSON containing line-based patches:
+
+```json
+{{
+  "patches": [
+    {{
+      "path": "path/to/file.ext",
+      "changes": [
+        {{
+          "lines": [START_LINE, END_LINE],
+          "new_content": "replacement code here",
+          "description": "what this change does"
+        }}
+      ],
+      "add_at_line": 1,
+      "add_content": "import {{ X }} from './newLocation';"
+    }}
+  ],
+  "reasoning": "Brief explanation"
+}}
+```
+
+RULES:
+1. Use EXACT line numbers from the snippets above
+2. "lines": [START, END] replaces lines START through END (inclusive)
+3. For insertions, use "add_at_line" and "add_content"
+4. Include all replaced lines' content in "new_content"
+5. Preserve indentation
+"""
+
+    def _run_simple_format_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+    ) -> AgentResult:
+        """Run simple format mode - text-based output for smaller LLMs (7B-14B).
+        
+        This mode uses a simpler text-based output format instead of JSON,
+        which is easier for smaller models to generate correctly.
+        
+        Output format:
+            STRATEGY: interface_extraction
+            REASONING: Break cycle by extracting interface
+            
+            FILE: src/auth/AuthService.ts
+            CHANGE: lines 1-2
+            ---
+            import { IUserProvider } from '../shared/IUserProvider';
+            ---
+            DESCRIPTION: Use interface import
+        
+        Returns:
+            AgentResult with RefactorProposal
+        """
+        logger.info("Running in SIMPLE FORMAT MODE (for smaller LLMs)")
+        
+        # Build file dicts with content
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        # Build numbered file snippets (reuse from line-patch mode)
+        file_budget = int(self.context_window * 0.45 * 4)
+        numbered_snippets, line_counts = build_numbered_file_snippets(
+            files_dict,
+            max_chars_per_file=file_budget // max(len(files_dict), 1),
+        )
+        
+        logger.info(f"Built numbered snippets for {len(line_counts)} files")
+        
+        # Extract strategy hint from description
+        strategy = self._extract_strategy_from_description(description)
+        
+        # Build simple format prompt
+        prompt_text = build_simple_format_prompt(
+            cycle_info=cycle_dict,
+            file_snippets=numbered_snippets,
+            strategy_hint=strategy,
+        )
+        
+        # Enforce prompt budget
+        prompt_text = self._enforce_prompt_budget(prompt_text, numbered_snippets, cycle_spec.get_file_paths())
+        
+        logger.debug(f"Built simple format prompt with {len(prompt_text)} chars")
+        
+        try:
+            # Log LLM input
+            call_id = log_llm_call(
+                "refactor", "simple_format_mode",
+                prompt_text,
+                context={"cycle_id": cycle_spec.id, "mode": "simple_format"}
+            )
+            
+            llm_start = datetime.now()
+            llm_response = call_llm(self.llm, prompt_text)
+            llm_duration = (datetime.now() - llm_start).total_seconds() * 1000
+            
+            # Log LLM output
+            response_str = str(llm_response) if isinstance(llm_response, str) else json.dumps(llm_response)
+            log_llm_response(
+                "refactor", "simple_format_mode",
+                llm_response,
+                call_id=call_id,
+                duration_ms=llm_duration
+            )
+            
+            logger.debug(f"LLM response received: {len(response_str)} chars")
+            
+            # Parse simple format output
+            simple_result = parse_simple_format(response_str)
+            logger.info(f"Parsed {len(simple_result.changes)} changes, strategy: {simple_result.strategy}")
+            
+            # Log any parse warnings
+            for warning in simple_result.parse_warnings:
+                logger.warning(f"Parse warning: {warning}")
+            
+            # Convert to line patches and apply
+            line_patches = convert_simple_to_line_patches(simple_result)
+            
+            # Apply patches and build results
+            patches = []
+            for f in cycle_spec.files:
+                # Find matching patch for this file
+                file_patch = None
+                for p in line_patches:
+                    patch_path = p.get("path", "")
+                    if patch_path == f.path or f.path.endswith(patch_path.split('/')[-1]):
+                        file_patch = p
+                        break
+                
+                original = f.content or ""
+                
+                if file_patch:
+                    if file_patch.get("is_new_file"):
+                        # This shouldn't happen for existing files, skip
+                        patches.append(Patch(
+                            path=f.path,
+                            original=original,
+                            patched=original,
+                            diff="",
+                            status="unchanged",
+                        ))
+                    else:
+                        # Apply line-based patches
+                        result = apply_line_patches(original, [file_patch])
+                        patched = result.content
+                        
+                        if result.success and result.applied_count > 0:
+                            diff = self._make_unified_diff(original, patched, f.path)
+                            patches.append(Patch(
+                                path=f.path,
+                                original=original,
+                                patched=patched,
+                                diff=diff,
+                                status="applied",
+                                confidence=1.0,
+                                applied_blocks=result.applied_count,
+                                total_blocks=result.total_count,
+                                warnings=result.warnings,
+                            ))
+                            logger.info(f"Applied {result.applied_count} change(s) to {f.path}")
+                        else:
+                            patches.append(Patch(
+                                path=f.path,
+                                original=original,
+                                patched=original,
+                                diff="",
+                                status="failed",
+                                confidence=0.0,
+                                warnings=result.errors + result.warnings,
+                            ))
+                            logger.warning(f"Failed to apply changes to {f.path}: {result.errors}")
+                else:
+                    patches.append(Patch(
+                        path=f.path,
+                        original=original,
+                        patched=original,
+                        diff="",
+                        status="unchanged",
+                    ))
+            
+            # Handle new files from simple format
+            for p in line_patches:
+                if p.get("is_new_file"):
+                    new_path = p.get("path", "")
+                    new_content = p.get("content", "")
+                    patches.append(Patch(
+                        path=new_path,
+                        original="",
+                        patched=new_content,
+                        diff=f"+++ {new_path}\n{new_content[:500]}..." if len(new_content) > 500 else f"+++ {new_path}\n{new_content}",
+                        status="new_file",
+                        confidence=1.0,
+                    ))
+                    logger.info(f"Created new file: {new_path}")
+            
+            proposal = RefactorProposal(
+                patches=patches,
+                rationale=f"Simple format: {simple_result.strategy or 'auto'}. {simple_result.reasoning}",
+                llm_response=response_str,
+            )
+            
+            applied_count = sum(1 for p in patches if p.status in ("applied", "new_file"))
+            logger.info(f"Simple format mode complete: {applied_count}/{len(patches)} files modified")
+            
+            return AgentResult(status="success", output=proposal.model_dump())
+            
+        except Exception as e:
+            logger.error(f"Simple format mode failed: {e}", exc_info=True)
+            return AgentResult(status="error", output=None, logs=f"Simple format mode failed: {e}")
 
     def _run_scaffolding_mode(
         self,
@@ -2339,6 +2763,33 @@ public class Foo : INewInterface
                     patch_status = "applied"
                 
                 logger.debug(f"Applied JSON-style search/replace to {path}: {applied_blocks}/{total_blocks}")
+            elif patched_entry.get("line_patches") or patched_entry.get("changes"):
+                # Line-based patches - uses line numbers instead of text matching
+                line_changes = patched_entry.get("line_patches") or patched_entry.get("changes", [])
+                if not isinstance(line_changes, list):
+                    line_changes = [line_changes]
+                
+                # Build patch structure expected by apply_line_patches
+                patch_data = [{"path": path, "changes": line_changes}]
+                
+                line_result = apply_line_patches(original, patch_data)
+                patched = line_result.content
+                patch_warnings = line_result.warnings + line_result.errors
+                patch_confidence = 1.0 if line_result.success else 0.5
+                applied_blocks = line_result.applied_count
+                total_blocks = line_result.total_count
+                
+                if line_result.applied_count == 0:
+                    patch_status = "failed"
+                    revert_reason = "No line patches could be applied"
+                    has_critical_error = True
+                    self._log_failed_patch_details(
+                        path, original, patched_entry, patch_warnings, revert_reason
+                    )
+                else:
+                    patch_status = "applied"
+                
+                logger.debug(f"Applied line-based patches to {path}: {applied_blocks}/{total_blocks}")
             
             # Handle append/prepend operations (can be combined with search_replace OR used alone)
             append_content = patched_entry.get("append")
@@ -2532,10 +2983,30 @@ public class Foo : INewInterface
             logger.info("Using SUGGESTION MODE")
             return self._run_suggestion_mode(cycle_spec, description)
         
+        # Line-based patching mode - uses line numbers instead of text matching
+        if self.refactor_config.line_based_patching and self.llm is not None and validator_feedback is None:
+            logger.info("Using LINE-BASED PATCH MODE")
+            return self._run_line_patch_mode(cycle_spec, description)
+        
         # Minimal diff mode - focus on single smallest change
         if self.refactor_config.minimal_diff_mode and self.llm is not None and validator_feedback is None:
             logger.info("Using MINIMAL DIFF MODE")
             return self._run_minimal_diff_mode(cycle_spec, description)
+        
+        # Simple format mode - text-based output for smaller LLMs (7B-14B)
+        # Can be explicitly enabled or auto-detected from model name
+        use_simple = self.refactor_config.simple_format_mode
+        if not use_simple and hasattr(self.llm, 'model'):
+            # Auto-detect based on model name
+            model_name = getattr(self.llm, 'model', '')
+            use_simple = should_use_simple_format(
+                model_name, 
+                auto_threshold_b=self.refactor_config.auto_simple_threshold
+            )
+        
+        if use_simple and self.llm is not None and validator_feedback is None:
+            logger.info("Using SIMPLE FORMAT MODE")
+            return self._run_simple_format_mode(cycle_spec, description)
         
         # Check if we should use sequential file mode
         num_files = len(cycle_spec.files)

@@ -1,0 +1,71 @@
+You are refactoring code to break a cyclic dependency.
+
+TASK: Break the cycle in a minimal, safe way by modifying ONE file.
+
+CYCLE TO BREAK:
+{cycle}
+
+TARGET FILE TO MODIFY:
+{target_file}
+
+AVAILABLE DEPENDENCY PATTERNS (copy these exactly if adding imports):
+{patterns}
+
+{file_content}
+
+=== OUTPUT FORMAT ===
+
+Respond with JSON containing line-based patches:
+
+```json
+{
+  "patches": [
+    {
+      "path": "path/to/file.ts",
+      "changes": [
+        {
+          "lines": [START_LINE, END_LINE],
+          "new_content": "replacement code here",
+          "description": "what this change does"
+        }
+      ],
+      "add_at_line": 1,
+      "add_content": "import { X } from './newLocation';"
+    }
+  ],
+  "reasoning": "Brief explanation of the refactoring approach"
+}
+```
+
+RULES:
+1. Use EXACT line numbers from the file snippets above
+2. "lines": [START, END] means replace lines START through END (inclusive)
+3. For insertions at a specific line, use "add_at_line" and "add_content"
+4. Include all replaced lines' content in "new_content"
+5. Sort multiple changes by line number for clarity
+6. Preserve indentation in new_content
+7. Only modify the target file
+
+COMMON PATTERNS:
+- Move an import from direct to lazy: change lines with the import
+- Extract interface: add import at top, change lines using the concrete type
+- Inject dependency: modify constructor lines and add parameter
+
+Example for moving import to lazy loading:
+```json
+{
+  "patches": [{
+    "path": "src/service.ts",
+    "changes": [{
+      "lines": [3, 3],
+      "new_content": "",
+      "description": "Remove direct import"
+    }, {
+      "lines": [25, 27],
+      "new_content": "    const dep = await import('./dependency');\n    return dep.doThing(this.data);",
+      "description": "Use dynamic import inside method"
+    }]
+  }],
+  "reasoning": "Replaced static import with dynamic import to break initialization-time dependency"
+}
+```

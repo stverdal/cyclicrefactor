@@ -31,6 +31,9 @@ refactor:
   suggestion_mode: true         # If true, output suggestions for review (no patches applied)
   suggestion_context_lines: 7   # Lines of context around changes
   suggestion_output_format: markdown  # "markdown" or "json"
+  # Line-based patching - uses line numbers instead of SEARCH/REPLACE
+  line_based_patching: true     # Use line numbers for more reliable patching
+  line_patch_backup: true       # Create backup before applying line patches
   # Auto-repair settings
   auto_repair_syntax: true      # Attempt to auto-repair syntax errors in LLM output
   auto_repair_min_confidence: 0.6  # Minimum confidence to accept auto-repair
@@ -63,6 +66,8 @@ prompts:
   refactor_plan_compact: prompts/prompt_refactor_plan_compact.txt
   refactor_file: prompts/prompt_refactor_file.txt
   refactor_file_compact: prompts/prompt_refactor_file_compact.txt
+  refactor_line_patch: prompts/prompt_line_patch.txt
+  refactor_simple_format: prompts/prompt_simple_format.txt
   validator: prompts/prompt_validator.txt
   validator_compact: prompts/prompt_validator_compact.txt
   explainer: prompts/prompt_explainer.txt

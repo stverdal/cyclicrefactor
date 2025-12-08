@@ -63,6 +63,9 @@ class RefactorConfig(BaseModel):
     suggestion_mode: bool = False       # If True, output suggestions without applying patches
     suggestion_context_lines: int = 7   # Number of context lines to include around changes
     suggestion_output_format: str = "markdown"  # Output format: "markdown" or "json"
+    # Line-based patching - use line numbers instead of SEARCH/REPLACE text matching
+    line_based_patching: bool = False   # If True, use line numbers for more reliable patching
+    line_patch_backup: bool = True      # If True, create backup before applying line patches
 
 
 class IOConfig(BaseModel):
