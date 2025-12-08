@@ -308,13 +308,17 @@ Analyze this cycle and provide:
         if not weakest_edge:
             return ""
         
-        return f\"\"\"
+        source = weakest_edge.get('source', 'unknown')
+        target = weakest_edge.get('target', 'unknown')
+        reason = weakest_edge.get('reason', 'lowest coupling in cycle')
+        
+        return f"""
 **Recommended Break Point (Weakest Edge)**:
-The edge from `{weakest_edge.get('source')}` → `{weakest_edge.get('target')}` is the best candidate to break.
-Reason: {weakest_edge.get('reason', 'lowest coupling in cycle')}
+The edge from `{source}` → `{target}` is the best candidate to break.
+Reason: {reason}
 
 Focus your refactoring on removing or inverting this specific dependency.
-\"\"\"
+"""
 
     def run(self, cycle_spec: Union[CycleSpec, Dict[str, Any]], prompt: str = None) -> AgentResult:
         """Describe the cyclic dependency with classification and strategy recommendations.
