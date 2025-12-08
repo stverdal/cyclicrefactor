@@ -436,6 +436,9 @@ After:
                 cycle_spec, description, file_snippets, strategy, pattern_example
             )
         
+        # Enforce prompt budget
+        prompt_text = self._enforce_prompt_budget(prompt_text, file_snippets, cycle_spec.get_file_paths())
+        
         logger.debug(f"Built suggestion prompt with {len(prompt_text)} chars")
         
         try:
@@ -464,7 +467,7 @@ After:
             # Build suggestion report from LLM response
             context_lines = self.refactor_config.suggestion_context_lines
             report = build_suggestion_report(
-                cycle_spec=cycle_dict,
+                cycle_spec=cycle_spec,  # Pass the CycleSpec object, not dict
                 llm_response=response_str,
                 strategy=strategy,
                 context_lines=context_lines,
@@ -845,7 +848,7 @@ Output ONLY the JSON.
         template_path = self._get_plan_template()
         if template_path:
             tpl = load_template(template_path)
-            return safe_format(
+            prompt = safe_format(
                 tpl,
                 id=cycle.id,
                 graph=json.dumps(cycle.graph.model_dump()),
@@ -853,9 +856,10 @@ Output ONLY the JSON.
                 description=description.text,
                 file_snippets=file_snippets,
             )
+            return self._enforce_prompt_budget(prompt, file_snippets, file_paths)
         
         # Fallback inline template
-        return f"""Create a refactoring plan to break this cyclic dependency.
+        prompt = f"""Create a refactoring plan to break this cyclic dependency.
 
 ## Cycle: {cycle.id}
 Graph: {json.dumps(cycle.graph.model_dump())}
@@ -869,6 +873,7 @@ Files: {', '.join(file_paths)}
 
 Output a JSON plan with: strategy, summary, file_changes (per file), execution_order.
 """
+        return self._enforce_prompt_budget(prompt, file_snippets, file_paths)
 
     def _build_per_file_prompt(
         self,
@@ -898,7 +903,7 @@ Output a JSON plan with: strategy, summary, file_changes (per file), execution_o
         template_path = self._get_file_template()
         if template_path:
             tpl = load_template(template_path)
-            return safe_format(
+            prompt = safe_format(
                 tpl,
                 plan=json.dumps(plan, indent=2),
                 file_path=file_path,
@@ -906,9 +911,10 @@ Output a JSON plan with: strategy, summary, file_changes (per file), execution_o
                 file_content=file_content,
                 previous_changes=prev_str,
             )
+            return self._enforce_prompt_budget(prompt, file_content, [file_path])
         
         # Fallback inline template
-        return f"""Implement the refactoring plan for this file.
+        prompt = f"""Implement the refactoring plan for this file.
 
 ## Plan
 {json.dumps(plan, indent=2)}
@@ -927,6 +933,7 @@ Output a JSON plan with: strategy, summary, file_changes (per file), execution_o
 Output JSON with: path, search_replace (list of {{search, replace}}), changes_made.
 Include 3+ lines of context in each SEARCH block.
 """
+        return self._enforce_prompt_budget(prompt, file_content, [file_path])
 
     def _run_sequential_mode(
         self,
@@ -1534,6 +1541,9 @@ Output ONLY the complete file content, no JSON wrapper. Start directly with the 
             # Append feedback if provided
             if feedback:
                 result += self._format_feedback(feedback)
+            
+            # Validate and truncate if prompt exceeds context window
+            result = self._enforce_prompt_budget(result, file_snippets, file_paths)
             return result
 
         # Default prompt with chain-of-thought structure
@@ -1629,6 +1639,108 @@ public class Foo : INewInterface
 4. Preserve existing functionality
 5. DO NOT truncate your output - if file is too large, use SEARCH/REPLACE
 """
+        # Validate and truncate if prompt exceeds context window
+        prompt = self._enforce_prompt_budget(prompt, file_snippets, file_paths)
+        return prompt
+    
+    def _enforce_prompt_budget(
+        self, 
+        prompt: str, 
+        file_snippets: str,
+        file_paths: List[str],
+    ) -> str:
+        """Ensure prompt fits within context window, truncating if necessary.
+        
+        Reserves ~30% of context for LLM output.
+        If prompt exceeds budget, progressively truncates:
+        1. RAG context
+        2. Pattern examples
+        3. File snippets (keeping most relevant)
+        
+        Args:
+            prompt: The full prompt text
+            file_snippets: Original file snippets (for potential re-truncation)
+            file_paths: List of file paths in the cycle
+            
+        Returns:
+            Prompt that fits within context budget
+        """
+        # Reserve 30% for output, use 70% for prompt
+        max_prompt_tokens = int(self.context_window * 0.7)
+        max_prompt_chars = max_prompt_tokens * 4  # ~4 chars per token
+        
+        current_len = len(prompt)
+        
+        if current_len <= max_prompt_chars:
+            logger.debug(f"Prompt within budget: {current_len} chars <= {max_prompt_chars} max")
+            return prompt
+        
+        logger.warning(f"Prompt exceeds budget: {current_len} chars > {max_prompt_chars} max ({max_prompt_tokens} tokens). Truncating...")
+        
+        # Strategy 1: Remove RAG context section
+        rag_marker = "## Reference (from architecture literature)"
+        if rag_marker in prompt:
+            # Find and remove the RAG section
+            rag_start = prompt.find(rag_marker)
+            # Find the next section (## header)
+            next_section = prompt.find("\n## ", rag_start + len(rag_marker))
+            if next_section == -1:
+                next_section = prompt.find("\n---", rag_start + len(rag_marker))
+            if next_section != -1:
+                prompt = prompt[:rag_start] + prompt[next_section:]
+                logger.debug(f"Removed RAG context. New length: {len(prompt)} chars")
+                if len(prompt) <= max_prompt_chars:
+                    return prompt
+        
+        # Strategy 2: Remove pattern examples
+        pattern_markers = ["**Interface Extraction Pattern**", "**Dependency Inversion Pattern**", 
+                          "**Shared Module Extraction Pattern**", "**Common Refactoring Patterns:**"]
+        for marker in pattern_markers:
+            if marker in prompt:
+                pattern_start = prompt.find(marker)
+                # Find end of pattern section (next ## or ---)
+                pattern_end = prompt.find("\n## ", pattern_start + len(marker))
+                if pattern_end == -1:
+                    pattern_end = prompt.find("\n---", pattern_start + len(marker))
+                if pattern_end != -1:
+                    prompt = prompt[:pattern_start] + prompt[pattern_end:]
+                    logger.debug(f"Removed pattern example. New length: {len(prompt)} chars")
+                    if len(prompt) <= max_prompt_chars:
+                        return prompt
+        
+        # Strategy 3: Truncate file snippets more aggressively
+        file_section_start = prompt.find("## Source Code")
+        if file_section_start == -1:
+            file_section_start = prompt.find("--- FILE:")
+        
+        if file_section_start != -1:
+            # Find end of file section
+            file_section_end = prompt.find("\n## ", file_section_start + 20)
+            if file_section_end == -1:
+                file_section_end = prompt.find("\n---\n", file_section_start + 20)
+            
+            if file_section_end != -1:
+                # Calculate how much we need to cut
+                excess = len(prompt) - max_prompt_chars
+                file_section = prompt[file_section_start:file_section_end]
+                
+                # Truncate file section content
+                if len(file_section) > excess + 500:  # Keep at least 500 chars
+                    # Keep header and truncate content
+                    header_end = file_section.find("\n", 20) + 1
+                    header = file_section[:header_end] if header_end > 0 else "## Source Code\n"
+                    available = len(file_section) - excess - 200
+                    truncated_files = file_section[header_end:header_end + available]
+                    truncated_files += f"\n\n... (truncated to fit context window - {len(file_paths)} files total) ..."
+                    
+                    prompt = prompt[:file_section_start] + header + truncated_files + prompt[file_section_end:]
+                    logger.debug(f"Truncated file snippets. New length: {len(prompt)} chars")
+        
+        # Final fallback: hard truncate with warning
+        if len(prompt) > max_prompt_chars:
+            logger.error(f"Could not fit prompt in budget. Hard truncating from {len(prompt)} to {max_prompt_chars} chars")
+            prompt = prompt[:max_prompt_chars - 100] + "\n\n... [TRUNCATED - context limit reached] ..."
+        
         return prompt
 
     def _format_feedback(self, feedback: ValidationReport) -> str:

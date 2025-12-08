@@ -34,7 +34,7 @@ def build_suggestion_report(
     """Build a SuggestionReport from LLM response.
     
     Args:
-        cycle_spec: The cycle specification with file contents
+        cycle_spec: The cycle specification with file contents (CycleSpec object or dict)
         llm_response: Raw LLM response (JSON or structured text)
         strategy: The refactoring strategy used
         strategy_rationale: Why this strategy was chosen
@@ -43,6 +43,21 @@ def build_suggestion_report(
     Returns:
         SuggestionReport ready for human review
     """
+    # Handle dict input for backward compatibility
+    if isinstance(cycle_spec, dict):
+        try:
+            cycle_spec = CycleSpec.model_validate(cycle_spec)
+        except Exception as e:
+            logger.warning(f"Failed to convert dict to CycleSpec: {e}")
+            # Create a minimal CycleSpec
+            from models.schemas import GraphSpec, FileSpec
+            cycle_spec = CycleSpec(
+                id=cycle_spec.get("id", "unknown"),
+                graph=GraphSpec(nodes=[], edges=[]),
+                files=[FileSpec(path=f.get("path", ""), content=f.get("content", "")) 
+                       for f in cycle_spec.get("files", [])],
+            )
+    
     report = SuggestionReport(
         cycle_id=cycle_spec.id,
         strategy=strategy,
