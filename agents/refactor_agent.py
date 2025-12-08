@@ -485,7 +485,7 @@ After:
             report = add_validation_to_report(report, cycle_spec)
             
             # Enrich with surrounding context from source files
-            report = enrich_with_context(report, files_dict, context_lines)
+            report.suggestions = enrich_with_context(report.suggestions, cycle_spec, context_lines)
             
             logger.info(f"Suggestion mode complete: {len(report.suggestions)} suggestions, "
                        f"cycle_will_be_broken={report.cycle_will_be_broken}, "
