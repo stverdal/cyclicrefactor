@@ -80,6 +80,11 @@ class Persistor:
 
     def persist_proposal(self, artifact_id: str, proposal: Dict[str, Any]) -> Path:
         p = self.save_json(artifact_id, "proposal/proposal.json", proposal)
+        
+        # If suggestion mode, also save markdown for easy viewing
+        if proposal.get("mode") == "suggestion" and proposal.get("markdown"):
+            self.save_text(artifact_id, "suggestion/suggestions.md", proposal["markdown"])
+        
         # persist patches as individual files and diffs
         patches = proposal.get("patches", [])
         base = self.artifact_path(artifact_id)
