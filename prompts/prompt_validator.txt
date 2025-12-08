@@ -2,16 +2,22 @@
 
 You are a senior engineer reviewing a proposed refactor that aims to break a cyclic dependency.
 
-## Cycle Information
+## Original Cycle (BEFORE changes)
 - ID: {id}
-- Dependency graph: {graph}
+- Original dependency graph: {graph}
 - Affected files: {files}
 
-## Description (from Describer)
+IMPORTANT: The graph above shows the cycle AS IT EXISTS BEFORE the proposed changes.
+It is NOT the current state after applying the diffs. You must analyze the code changes
+to determine whether they successfully break this cycle.
+
+## Description
 {description}
 
 ## Proposed Changes
 {diffs}
+
+---
 
 ---
 
@@ -48,22 +54,31 @@ Proposed changes claim to extract IUserService interface but:
 ## Validation Checklist
 
 ### 1. Cycle Actually Broken?
-- [ ] The problematic import/reference has been removed or inverted
-- [ ] No new cyclic paths introduced
-- [ ] Dependency direction now follows proper architecture (high→low)
+Analyze the PROPOSED CHANGES (diffs) to determine:
+- [ ] Does the change remove or invert the problematic import/reference?
+- [ ] After applying these diffs, will the dependency direction change?
+- [ ] No new cyclic paths introduced by the changes?
+
+NOTE: The "Original dependency graph" above shows the cycle BEFORE changes.
+You must determine from the DIFFS whether the cycle will be broken.
 
 ### 2. Type Consistency?
 - [ ] Every type referenced in changes EXISTS (in source or new_files)
 - [ ] If interface created, a class implements it
 - [ ] If interface used, it's imported correctly
 
-### 3. Syntax and Correctness?
+### 2. Syntax and Correctness?
 - [ ] All brackets/braces balanced
 - [ ] All imports are valid after changes
 - [ ] No broken references to renamed/moved types
 
+### 3. Semantics Valid?
+- [ ] Changes make logical sense
+- [ ] Functionality is preserved
+- [ ] No obvious bugs introduced
+
 ### 4. No-Op Detection?
-- [ ] No patches where search == replace
+- [ ] No patches where original == patched
 - [ ] Every change makes a meaningful modification
 
 ---
@@ -71,14 +86,16 @@ Proposed changes claim to extract IUserService interface but:
 ## Decision Criteria
 
 **APPROVED** if:
-- The cycle is broken (no critical/major issues)
+- The diffs will break the cycle (removes/inverts the problematic dependency)
 - Code is syntactically valid
+- All types/references are correct
 - Changes are complete and functional
 
 **NEEDS_REVISION** if:
-- Cycle still exists (files unchanged or dependency remains)
-- Syntax errors detected
-- Incomplete refactoring
+- The diffs do NOT break the cycle (dependency still exists after changes)
+- Syntax errors detected (unbalanced brackets, broken imports)
+- Missing type definitions or implementations
+- Incomplete or inconsistent changes
 
 ---
 
@@ -86,12 +103,12 @@ Proposed changes claim to extract IUserService interface but:
 ```json
 {
   "decision": "APPROVED" | "NEEDS_REVISION",
-  "summary": "<one-sentence verdict>",
+  "summary": "<one-sentence verdict about code quality>",
   "issues": [
     {
       "path": "path/to/file",
       "line": null,
-      "comment": "<specific issue>",
+      "comment": "<specific code quality issue>",
       "severity": "critical|major|minor"
     }
   ],

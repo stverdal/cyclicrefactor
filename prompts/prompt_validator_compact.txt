@@ -2,9 +2,12 @@
 
 Review this refactor proposal that aims to break a cyclic dependency.
 
-## Cycle: {id}
+## Original Cycle (BEFORE changes)
+ID: {id}
 Graph: {graph}
 Files: {files}
+
+NOTE: The graph above is the ORIGINAL cycle BEFORE changes. Analyze the diffs to see if they break it.
 
 ## Proposed Changes
 {diffs}
@@ -12,20 +15,20 @@ Files: {files}
 ---
 
 ## Check:
-1. Is the cycle broken? (problematic import removed/inverted)
+1. Do the diffs break the cycle? (removes/inverts the problematic import)
 2. Is syntax valid? (brackets balanced, imports correct)
 3. Is functionality preserved? (no behavior changes)
 
 ## Decision:
-- **APPROVED**: Cycle broken, code valid
-- **NEEDS_REVISION**: Cycle remains, syntax errors, or incomplete
+- **APPROVED**: Diffs will break the cycle, code valid
+- **NEEDS_REVISION**: Cycle not broken by diffs, syntax errors, or incomplete
 
 ## Output (JSON)
 
 ```json
 {
   "decision": "APPROVED|NEEDS_REVISION",
-  "summary": "<one sentence verdict>",
+  "summary": "<one sentence verdict about code quality>",
   "issues": [{"path": "file", "comment": "<issue>", "severity": "critical|major|minor"}],
   "suggestions": ["<specific fix if NEEDS_REVISION>"]
 }

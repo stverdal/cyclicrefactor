@@ -113,12 +113,14 @@ class ValidatorAgent(Agent):
         files_unchanged = len(proposal.patches) - files_changed
 
         # If we have a template file/path, load it
+        # NOTE: The graph shows the ORIGINAL cycle (before changes). The prompt template
+        # should clarify this so the LLM analyzes the diffs to determine if cycle is broken.
         if self.prompt_template:
             tpl = load_template(self.prompt_template)
             return safe_format(
                 tpl,
                 id=cycle.id,
-                graph=json.dumps(cycle.graph.model_dump()),
+                graph=json.dumps(cycle.graph.model_dump()),  # Original cycle graph (before changes)
                 files=", ".join(file_paths),
                 description=description.text,
                 patched_files=diffs_text,  # Now contains diffs, not full files
@@ -128,23 +130,29 @@ class ValidatorAgent(Agent):
             )
 
         # Default prompt - optimized for limited context
-        return f"""You are validating a refactor proposal to break a cyclic dependency.
+        # NOTE: Include graph as ORIGINAL (before changes) state so LLM can analyze diffs
+        graph_json = json.dumps(cycle.graph.model_dump())
+        return f"""You are validating a refactor proposal that aims to break a cyclic dependency.
 
-## Cycle
-- ID: {cycle.id}
-- Nodes: {', '.join(cycle.graph.nodes)}
-- Edges: {cycle.graph.edges}
+## Original Cycle (BEFORE changes)
+The following cycle exists in the codebase BEFORE applying the proposed changes:
+{graph_json}
+
+Files involved: {', '.join(cycle.graph.nodes)}
+
+IMPORTANT: The graph above shows the cycle AS IT EXISTS BEFORE the proposed changes.
+You must analyze the code changes (diffs) below to determine whether they successfully break this cycle.
 
 ## Problem Description
 {description.text[:1500] if len(description.text) > 1500 else description.text}
 
-## Changes ({files_changed} files modified, {files_unchanged} unchanged)
+## Proposed Changes ({files_changed} files modified, {files_unchanged} unchanged)
 {diffs_text}
 
-## Validation Checklist
-1. **Cycle Broken?** Do the changes remove/invert the problematic dependency?
+## Your Validation Focus
+1. **Cycle Broken?** Do the diffs remove or invert the problematic imports/dependencies shown in the original graph?
 2. **Syntax Valid?** Any unbalanced brackets, missing imports, or broken references?
-3. **Complete?** Are there remaining cyclic paths that weren't addressed?
+3. **Semantics Valid?** Do the changes make logical sense? Are there broken references?
 4. **Functionality Preserved?** Does the refactor maintain existing behavior?
 
 ## Output (JSON only)
