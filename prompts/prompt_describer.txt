@@ -19,25 +19,58 @@ You are an experienced software architecture analyst. Your task is to analyze a 
 ## Reference Materials (from architecture literature)
 {rag_context}
 
-## Your Task
+---
 
-**Step 1: Identify the Problem**
-- Which specific imports/references create the cycle?
-- What type of cycle is this (bidirectional, transitive, layer violation)?
+## EXAMPLE ANALYSIS
 
-**Step 2: Analyze the Impact**
-- Why is this cycle problematic?
-- What are the maintainability/testability consequences?
+### Example Input:
+Cycle: OrderService.cs → UserService.cs → OrderService.cs
+Graph: OrderService imports UserService for GetUserName(), UserService imports OrderService for GetOrderCount()
 
-**Step 3: Recommend a Strategy**
-Based on the cycle type, recommend ONE of:
-- **Interface Extraction**: For bidirectional dependencies between two modules
-- **Dependency Inversion**: For layer violations (lower layer depending on higher)
-- **Shared Module**: For transitive cycles with common functionality
-- **Mediator Pattern**: For complex multi-way communication
+### Example Output:
+```json
+{
+  "text": "Bidirectional dependency between OrderService and UserService. OrderService needs user names for display, while UserService needs order counts for loyalty tier calculation. Both services are tightly coupled, making independent testing impossible and creating deployment dependencies.",
+  "cycle_type": "bidirectional",
+  "recommended_strategy": "interface_extraction",
+  "strategy_rationale": "Since UserService only needs GetOrderCount() from OrderService, extract IOrderCounter interface. UserService depends on the interface, OrderService implements it. This inverts the problematic direction.",
+  "first_steps": [
+    "Create IOrderCounter interface with GetOrderCount(int userId) method",
+    "Have OrderService implement IOrderCounter",
+    "Change UserService to depend on IOrderCounter instead of OrderService"
+  ],
+  "highlights": [
+    {"path": "Services/UserService.cs", "explanation": "Contains the import of OrderService that should be removed"},
+    {"path": "Services/OrderService.cs", "explanation": "Should implement the new IOrderCounter interface"}
+  ]
+}
+```
 
-**Step 4: Provide First Steps**
-Give 2-3 concrete, actionable steps the Refactor agent should take.
+---
+
+## Your Task: REASON STEP BY STEP
+
+**Step 1: IDENTIFY the imports**
+Look at the Source Code. List each import/using that creates the cycle.
+Write: "File A imports X from File B. File B imports Y from File A."
+
+**Step 2: CLASSIFY the cycle type**
+- **bidirectional**: A↔B (two files directly import each other)
+- **transitive**: A→B→C→A (chain of dependencies)
+- **layer_violation**: Lower layer imports higher layer
+
+**Step 3: ANALYZE why it's problematic**
+What are the consequences? (testing difficulty, deployment coupling, etc.)
+
+**Step 4: MATCH to strategy**
+| Cycle Type | Best Strategy | Why |
+|------------|--------------|-----|
+| bidirectional | interface_extraction | Break one direction with abstraction |
+| transitive | shared_module | Extract common code both can import |
+| layer_violation | dependency_inversion | Invert with abstraction in higher layer |
+
+**Step 5: DEFINE concrete first steps**
+What specific files/interfaces need to be created? Be precise with names.
 
 ## Output Format (JSON)
 ```json

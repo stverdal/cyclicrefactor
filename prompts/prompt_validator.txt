@@ -15,6 +15,36 @@ You are a senior engineer reviewing a proposed refactor that aims to break a cyc
 
 ---
 
+## EXAMPLE VALIDATION
+
+### Example Input:
+Proposed changes claim to extract IUserService interface but:
+- new_files contains IUserService.cs ✓
+- OrderService changes type from UserService to IUserService ✓
+- BUT: UserService.cs doesn't implement IUserService ✗
+
+### Example Output:
+```json
+{
+  "decision": "NEEDS_REVISION",
+  "summary": "Interface created but not implemented by UserService",
+  "issues": [
+    {
+      "path": "Services/UserService.cs",
+      "line": null,
+      "comment": "Class must implement IUserService (add ': IUserService' to class declaration)",
+      "severity": "critical"
+    }
+  ],
+  "suggestions": [
+    "Add ': IUserService' to UserService class declaration",
+    "Add 'using MyApp.Interfaces;' to UserService.cs"
+  ]
+}
+```
+
+---
+
 ## Validation Checklist
 
 ### 1. Cycle Actually Broken?
@@ -22,20 +52,19 @@ You are a senior engineer reviewing a proposed refactor that aims to break a cyc
 - [ ] No new cyclic paths introduced
 - [ ] Dependency direction now follows proper architecture (high→low)
 
-### 2. Syntax and Correctness?
+### 2. Type Consistency?
+- [ ] Every type referenced in changes EXISTS (in source or new_files)
+- [ ] If interface created, a class implements it
+- [ ] If interface used, it's imported correctly
+
+### 3. Syntax and Correctness?
 - [ ] All brackets/braces balanced
 - [ ] All imports are valid after changes
 - [ ] No broken references to renamed/moved types
 
-### 3. Functionality Preserved?
-- [ ] Public APIs unchanged (or properly migrated)
-- [ ] Existing behavior maintained
-- [ ] No unintended side effects
-
-### 4. Quality of Solution?
-- [ ] Minimal changes to achieve goal
-- [ ] Follows recommended patterns (interface extraction, DI, etc.)
-- [ ] Code is readable and maintainable
+### 4. No-Op Detection?
+- [ ] No patches where search == replace
+- [ ] Every change makes a meaningful modification
 
 ---
 

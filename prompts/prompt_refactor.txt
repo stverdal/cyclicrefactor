@@ -229,4 +229,30 @@ This is WRONG because `ISensorType` doesn't exist! You MUST create it first.
 ```
 This changes nothing! Only include patches that actually modify code.
 
+---
+
+## 🔍 SELF-VERIFICATION CHECKLIST (Complete Before Output)
+
+Before outputting your JSON, verify each item:
+
+### 1. Search String Verification
+For EACH search_replace entry, find the EXACT search text in Source Code above.
+□ I can locate every SEARCH string verbatim in the source (not paraphrased)
+□ Each SEARCH includes 3+ lines of context before AND after
+
+### 2. Type Existence Verification  
+For EACH type I reference in changes:
+□ The type already exists in Source Code, OR
+□ I am creating it in `new_files` with complete, valid content
+
+### 3. Cycle Break Verification
+□ My changes actually REMOVE or INVERT a dependency (not just rename types)
+□ After my changes, the import/using causing the cycle can be removed
+
+### 4. No-Op Detection
+□ None of my patches have search == replace
+□ Every patch makes a meaningful change
+
+**If ANY check fails → REVISE before outputting**
+
 Output ONLY the JSON or file markers. No additional commentary.

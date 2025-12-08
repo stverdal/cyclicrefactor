@@ -94,4 +94,19 @@ Follow the plan exactly. Implement the changes specified for this file.
 ❌ **Hallucinated types** - Don't use ISensorType if it doesn't exist yet
 ❌ **Missing interface** - If plan says "extract interface", the interface MUST be created in a new_files entry (done in planning phase)
 
+---
+
+## ✓ VERIFY BEFORE OUTPUT
+
+For each SEARCH string:
+□ I can find this EXACT text in File Content above (not paraphrased)
+□ I included 3+ lines of context before AND after
+
+For types I reference:
+□ Every type exists in source OR was created in previous changes
+
+For the overall change:
+□ My patches actually modify something (search ≠ replace)
+□ Changes align with the plan for this file
+
 Output ONLY the JSON object for this single file.

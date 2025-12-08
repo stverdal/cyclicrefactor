@@ -16,26 +16,83 @@ You are an expert software engineer. Analyze this cyclic dependency and create a
 
 ---
 
+## EXAMPLE PLAN
+
+### Example Input:
+Cycle: ReportGenerator.cs → DataService.cs → ReportGenerator.cs
+- ReportGenerator imports DataService for FetchData()
+- DataService imports ReportGenerator for FormatOutput()
+
+### Example Output:
+```json
+{
+  "strategy": "interface_extraction",
+  "summary": "Extract IOutputFormatter interface from ReportGenerator. DataService depends on interface, ReportGenerator implements it.",
+  "new_files": [
+    {
+      "path": "Interfaces/IOutputFormatter.cs",
+      "purpose": "Interface for output formatting",
+      "content_description": "Interface with FormatOutput(string data) method returning formatted string"
+    }
+  ],
+  "file_changes": [
+    {
+      "path": "ReportGenerator.cs",
+      "order": 1,
+      "changes": [
+        "Add 'using MyApp.Interfaces;'",
+        "Add ': IOutputFormatter' to class declaration",
+        "No other changes needed - method signature already matches"
+      ],
+      "imports_to_add": ["using MyApp.Interfaces;"],
+      "imports_to_remove": [],
+      "reason": "ReportGenerator implements the new interface"
+    },
+    {
+      "path": "DataService.cs",
+      "order": 2,
+      "changes": [
+        "Remove 'using MyApp.Reports;'",
+        "Add 'using MyApp.Interfaces;'",
+        "Change constructor parameter from ReportGenerator to IOutputFormatter",
+        "Change field type from ReportGenerator to IOutputFormatter"
+      ],
+      "imports_to_remove": ["using MyApp.Reports;"],
+      "imports_to_add": ["using MyApp.Interfaces;"],
+      "reason": "DataService now depends on abstraction, breaking the cycle"
+    }
+  ],
+  "execution_order": ["Interfaces/IOutputFormatter.cs", "ReportGenerator.cs", "DataService.cs"],
+  "notes": "Interface file must be created first so other files can import it"
+}
+```
+
+---
+
 ## Your Task: Create a Refactoring Plan
 
-Analyze the cycle and produce a step-by-step plan. Do NOT write the actual code patches yet.
+### REASONING STEPS (Complete each before outputting)
 
-### Step 1: Identify the Problematic Dependencies
-- Which specific imports/references create the cycle?
-- What is the direction of each dependency?
+**STEP 1: Map the Dependencies**
+Look at Source Code. For each file, list:
+- What does it import from cycle members?
+- What methods/types does it use from those imports?
 
-### Step 2: Choose a Strategy
-Pick ONE:
-- **interface_extraction**: Create interface, have one class implement it, other depends on interface
-- **dependency_inversion**: Create abstraction in higher layer, lower layer implements it
-- **shared_module**: Extract common code to new module both can import
+**STEP 2: Find the Weakest Link**
+Which dependency is easiest to break? Consider:
+- Fewer methods used = easier to abstract
+- Utility-like usage = good candidate for parameter injection
+- Type-heavy usage = needs interface extraction
 
-### Step 3: Plan Changes Per File
-For EACH file, specify:
-- What changes are needed
-- What imports to add/remove
-- What new types/methods to create
-- Order of changes (which file first)
+**STEP 3: Design the Abstraction**
+If creating interface/abstraction:
+- What methods must it include?
+- What namespace should it be in?
+- Which file implements it, which depends on it?
+
+**STEP 4: Order the Changes**
+New files must be created BEFORE files that import them.
+Implementation must come BEFORE usage.
 
 ---
 
@@ -72,4 +129,14 @@ For EACH file, specify:
 ```
 
 Be specific about WHAT to change. The actual code will be written in the next phase.
+
+---
+
+## ✓ VERIFICATION BEFORE OUTPUT
+
+□ Every file path I reference exists in the Source Code section
+□ If I'm creating an interface, I specified what methods it needs
+□ My execution_order starts with new files, then implementations, then consumers
+□ After all changes, the cycle-causing import can be removed
+
 Output ONLY the JSON object.

@@ -262,6 +262,147 @@ class Explanation(BaseModel):
 
 
 # =============================================================================
+# RefactorRoadmap - Demo-friendly output showing progress even on failures
+# =============================================================================
+
+
+class FailureClassification(BaseModel):
+    """Classification of why a patch or attempt failed."""
+    category: str = "unknown"  # hallucination, syntax, no_op, search_mismatch, validation, compile
+    description: str = ""
+    evidence: List[str] = Field(default_factory=list)  # Specific evidence for the classification
+    recoverable: bool = True  # Could this be fixed with another attempt?
+
+
+class PartialAttempt(BaseModel):
+    """A refactoring attempt that was partially completed or failed."""
+    file_path: str
+    intended_changes: List[str] = Field(default_factory=list)  # What we tried to do
+    actual_changes: List[str] = Field(default_factory=list)    # What we managed to do
+    failure_reason: str = ""
+    failure_classification: Optional[FailureClassification] = None
+    raw_llm_output: Optional[str] = None  # For debugging
+    suggested_fix: str = ""  # What a human should do to complete this
+
+
+class ScaffoldFile(BaseModel):
+    """A new file created during scaffolding phase (interfaces, abstractions)."""
+    path: str
+    content: str
+    purpose: str = ""  # "interface", "abstract_class", "shared_module"
+    validated: bool = False  # True if passed syntax/compile check
+    validation_errors: List[str] = Field(default_factory=list)
+
+
+class RefactorRoadmap(BaseModel):
+    """Demo-friendly output showing refactoring progress, even on partial failures.
+    
+    This provides visibility into what was attempted, what succeeded, and what
+    remains to be done - useful for demonstrations and iterative refinement.
+    """
+    cycle_id: str = ""
+    strategy_chosen: str = ""  # interface_extraction, dependency_inversion, etc.
+    strategy_rationale: str = ""
+    confidence: float = 0.0  # 0-1 overall confidence in the approach
+    
+    # Scaffolding phase results (for interface extraction)
+    scaffold_files: List[ScaffoldFile] = Field(default_factory=list)
+    scaffold_success: bool = True
+    
+    # What we successfully generated
+    successful_patches: List[Patch] = Field(default_factory=list)
+    
+    # What we attempted but failed
+    partial_attempts: List[PartialAttempt] = Field(default_factory=list)
+    
+    # Human-actionable next steps
+    remaining_work: List[str] = Field(default_factory=list)
+    
+    # Minimal diff recommendation (if enabled)
+    minimal_diff_target: Optional[str] = None  # The single edge to break
+    minimal_diff_patch: Optional[Patch] = None  # The minimal patch if generated
+    
+    # For demo: formatted executive summary
+    executive_summary: str = ""
+    
+    # Raw data for debugging
+    llm_responses: List[str] = Field(default_factory=list)
+    total_llm_calls: int = 0
+    total_tokens_used: int = 0
+    
+    @field_validator("successful_patches", mode="before")
+    @classmethod
+    def convert_patch_dicts(cls, v):
+        if isinstance(v, list):
+            return [Patch(**p) if isinstance(p, dict) else p for p in v]
+        return v
+    
+    @field_validator("scaffold_files", mode="before")
+    @classmethod
+    def convert_scaffold_dicts(cls, v):
+        if isinstance(v, list):
+            return [ScaffoldFile(**s) if isinstance(s, dict) else s for s in v]
+        return v
+    
+    @field_validator("partial_attempts", mode="before")
+    @classmethod
+    def convert_attempt_dicts(cls, v):
+        if isinstance(v, list):
+            return [PartialAttempt(**a) if isinstance(a, dict) else a for a in v]
+        return v
+    
+    def generate_executive_summary(self) -> str:
+        """Generate a human-readable summary for demos."""
+        lines = [f"## Refactoring Roadmap: {self.cycle_id}", ""]
+        
+        # Strategy
+        lines.append(f"**Strategy**: {self.strategy_chosen}")
+        if self.strategy_rationale:
+            lines.append(f"*{self.strategy_rationale}*")
+        lines.append(f"**Confidence**: {self.confidence:.0%}")
+        lines.append("")
+        
+        # Scaffolding
+        if self.scaffold_files:
+            lines.append("### Scaffolding (New Files Created)")
+            for sf in self.scaffold_files:
+                status = "✅" if sf.validated else "❌"
+                lines.append(f"- {status} `{sf.path}` - {sf.purpose}")
+            lines.append("")
+        
+        # Successes
+        if self.successful_patches:
+            lines.append("### Successful Changes")
+            for patch in self.successful_patches:
+                lines.append(f"- ✅ `{patch.path}` - {patch.status}")
+            lines.append("")
+        
+        # Partial attempts
+        if self.partial_attempts:
+            lines.append("### Partial/Failed Attempts")
+            for attempt in self.partial_attempts:
+                category = attempt.failure_classification.category if attempt.failure_classification else "unknown"
+                lines.append(f"- ⚠️ `{attempt.file_path}` - {category}: {attempt.failure_reason[:100]}")
+            lines.append("")
+        
+        # Remaining work
+        if self.remaining_work:
+            lines.append("### Remaining Work (Human Action Required)")
+            for i, work in enumerate(self.remaining_work, 1):
+                lines.append(f"{i}. {work}")
+            lines.append("")
+        
+        # Minimal diff
+        if self.minimal_diff_target:
+            lines.append("### Minimal Diff Recommendation")
+            lines.append(f"Focus on breaking the edge: **{self.minimal_diff_target}**")
+            if self.minimal_diff_patch:
+                lines.append(f"Suggested file: `{self.minimal_diff_patch.path}`")
+        
+        return "\n".join(lines)
+
+
+# =============================================================================
 # Dependency Analysis Schemas (Optional Pre-Pipeline Phase)
 # =============================================================================
 

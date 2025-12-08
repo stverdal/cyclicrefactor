@@ -1,0 +1,122 @@
+# Simple Refactor Prompt (for 7B and smaller LLMs)
+# Uses line-based format instead of JSON for reliability
+
+Break the cyclic dependency using the simple format below.
+
+## Cycle: {id}
+Graph: {graph}
+
+## Source Code
+{file_snippets}
+
+---
+
+## COMPLETE EXAMPLE
+
+### Example Input:
+Cycle: ServiceA.cs imports ServiceB.cs, ServiceB.cs imports ServiceA.cs
+Graph: ServiceA → ServiceB → ServiceA
+
+```csharp
+// ServiceA.cs
+using MyApp.Services;
+
+namespace MyApp.Services
+{
+    public class ServiceA
+    {
+        private ServiceB _serviceB;
+        public string GetData() => _serviceB.Process();
+    }
+}
+
+// ServiceB.cs  
+using MyApp.Services;
+
+namespace MyApp.Services
+{
+    public class ServiceB
+    {
+        private ServiceA _serviceA;
+        public void LogStatus() => Console.WriteLine(_serviceA.GetData());
+        public string Process() => "processed";
+    }
+}
+```
+
+### Example Output:
+
+```
+STRATEGY: interface_extraction
+
+NEW_FILE: Interfaces/IServiceA.cs
+---BEGIN---
+using System;
+
+namespace MyApp.Interfaces
+{
+    public interface IServiceA
+    {
+        string GetData();
+    }
+}
+---END---
+
+MODIFY: ServiceA.cs
+ADD_USING: using MyApp.Interfaces;
+AFTER_CLASS_DECLARATION: , IServiceA
+
+MODIFY: ServiceB.cs
+REMOVE_USING: using MyApp.Services;
+ADD_USING: using MyApp.Interfaces;
+SEARCH:
+        private ServiceA _serviceA;
+REPLACE:
+        private IServiceA _serviceA;
+
+CYCLE_BROKEN: Yes - ServiceB now depends on IServiceA interface, not ServiceA directly
+```
+
+---
+
+## YOUR TASK
+
+1. FIND the import that creates the cycle
+2. CHOOSE strategy: interface_extraction, dependency_inversion, or parameter_injection
+3. OUTPUT using the format below
+
+## OUTPUT FORMAT
+
+```
+STRATEGY: <interface_extraction|dependency_inversion|parameter_injection>
+
+NEW_FILE: <path/to/new/file.ext>
+---BEGIN---
+<complete file content>
+---END---
+
+MODIFY: <path/to/existing/file.ext>
+ADD_USING: <new import to add at top>
+REMOVE_USING: <import to remove>
+SEARCH:
+<exact lines from source - copy verbatim>
+REPLACE:
+<new lines to replace with>
+
+CYCLE_BROKEN: <Yes/No - explain if cycle is broken>
+```
+
+## RULES
+
+1. SEARCH text must be EXACTLY as shown in Source Code (copy-paste, don't retype)
+2. Include 2+ lines around the code you're changing
+3. NEW_FILE content must be complete and valid
+4. Every type you use must exist (in source OR in your NEW_FILE)
+
+## VERIFY BEFORE OUTPUT
+
+□ Can I find my SEARCH text exactly in Source Code? 
+□ If I create IServiceA, is it in NEW_FILE with full content?
+□ Does my change actually break the cycle?
+
+Output ONLY the formatted response. No extra commentary.

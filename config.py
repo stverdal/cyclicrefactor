@@ -44,6 +44,21 @@ class RefactorConfig(BaseModel):
     rule_based_validation: bool = True  # If True, run rule-based validation (set False to skip)
     block_on_validation_failure: bool = True  # If True, reject patches that fail validation
     hallucination_detection: bool = True  # If True, detect and warn about LLM hallucinations
+    # === NEW: Advanced Refactoring Modes ===
+    # Roadmap mode - outputs detailed progress even on failures (good for demos)
+    roadmap_mode: bool = False          # If True, output RefactorRoadmap with partial results
+    # Minimal diff mode - focus on single smallest change to break cycle
+    minimal_diff_mode: bool = False     # If True, generate only the minimal change needed
+    # Scaffolding mode - create interfaces/abstractions BEFORE modifying existing files
+    scaffolding_mode: bool = False      # If True, create new files first, validate, then modify
+    scaffolding_validate: bool = True   # If True, compile-check scaffold files before proceeding
+    # Full file context - send complete files when they fit in context
+    prioritize_full_files: bool = True  # If True, send full file content when it fits
+    full_file_max_chars: int = 8000     # Max chars per file to include full content
+    full_file_budget_pct: float = 0.4   # Max % of context window for file content
+    # Simple format mode - use line-based format instead of JSON for very small LLMs
+    simple_format_mode: bool = False    # If True, use simple line-based format for 7B and smaller
+    auto_simple_threshold: int = 8      # Auto-enable simple format if model size (B) <= this
 
 
 class IOConfig(BaseModel):

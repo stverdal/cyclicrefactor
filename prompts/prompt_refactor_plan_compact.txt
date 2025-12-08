@@ -14,6 +14,36 @@ Files: {files}
 
 ---
 
+## EXAMPLE
+
+**Input:** OrderService → UserService → OrderService
+
+**Output:**
+```json
+{
+  "strategy": "interface_extraction",
+  "summary": "Extract IOrderInfo interface. UserService depends on interface, OrderService implements it.",
+  "new_files": [{"path": "Interfaces/IOrderInfo.cs", "purpose": "Interface with GetOrderCount method"}],
+  "file_changes": [
+    {
+      "path": "OrderService.cs",
+      "order": 1,
+      "changes": ["Add IOrderInfo to class declaration"],
+      "reason": "Implements the interface"
+    },
+    {
+      "path": "UserService.cs",
+      "order": 2,
+      "changes": ["Replace OrderService with IOrderInfo", "Update imports"],
+      "reason": "Breaks the cycle by depending on abstraction"
+    }
+  ],
+  "execution_order": ["Interfaces/IOrderInfo.cs", "OrderService.cs", "UserService.cs"]
+}
+```
+
+---
+
 ## Output (JSON)
 
 ```json
@@ -33,4 +63,8 @@ Files: {files}
 }
 ```
 
-Be specific. Output ONLY JSON.
+## ✓ VERIFY
+□ New files listed in execution_order FIRST
+□ Each change helps break the cycle
+
+Output ONLY JSON.

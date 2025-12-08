@@ -7,7 +7,146 @@ token limits while preserving important context.
 
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Set, Tuple
+from typing import Dict, Any, List, Set, Tuple, Optional
+
+
+def prioritize_full_files(
+    files: List[Dict[str, Any]],
+    total_budget_chars: int,
+    max_chars_per_file: int = 8000,
+    budget_pct: float = 0.4,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Prioritize including full file content for smaller files that fit in budget.
+    
+    This helps LLM see complete context instead of snippets, improving accuracy.
+    Files are sorted by size (smallest first) to maximize the number of complete files.
+    
+    Args:
+        files: List of file dicts with 'path' and 'content' keys
+        total_budget_chars: Total character budget for all file content
+        max_chars_per_file: Maximum chars per file to consider "small enough" for full inclusion
+        budget_pct: Maximum percentage of budget to use for full files
+        
+    Returns:
+        Tuple of (full_files, remaining_files) where full_files should be included
+        completely and remaining_files need snippet extraction
+    """
+    if not files:
+        return [], []
+    
+    # Calculate the budget for full-file inclusion
+    full_file_budget = int(total_budget_chars * budget_pct)
+    
+    # Create list with sizes
+    sized_files = []
+    for f in files:
+        content = f.get('content', '') or ''
+        size = len(content)
+        sized_files.append({
+            'file': f,
+            'size': size,
+            'fits': size <= max_chars_per_file and size > 0
+        })
+    
+    # Sort by size (smallest first) to maximize number of full files
+    sized_files.sort(key=lambda x: x['size'])
+    
+    full_files = []
+    remaining_files = []
+    used_budget = 0
+    
+    for item in sized_files:
+        f = item['file']
+        size = item['size']
+        
+        # Check if this file fits in remaining budget AND is under per-file limit
+        if item['fits'] and (used_budget + size) <= full_file_budget:
+            full_files.append(f)
+            used_budget += size
+        else:
+            remaining_files.append(f)
+    
+    return full_files, remaining_files
+
+
+def build_file_snippets_with_priority(
+    files: List[Dict[str, Any]],
+    cycle: Dict[str, Any],
+    total_budget_chars: int,
+    prioritize_full: bool = True,
+    max_chars_per_file: int = 8000,
+    full_file_budget_pct: float = 0.4,
+    snippet_max_chars: int = 4000,
+) -> Tuple[str, Dict[str, str]]:
+    """Build file snippets with priority for full file inclusion.
+    
+    Args:
+        files: List of file dicts with 'path' and 'content' keys
+        cycle: Cycle spec dict for snippet extraction
+        total_budget_chars: Total character budget
+        prioritize_full: If True, include full content for small files
+        max_chars_per_file: Max chars for "small" file classification
+        full_file_budget_pct: Percentage of budget for full files
+        snippet_max_chars: Max chars per snippet for larger files
+        
+    Returns:
+        Tuple of (combined_snippets_string, file_status_dict) where status shows
+        whether each file was included in full or as snippet
+    """
+    file_status = {}
+    snippets = []
+    used_chars = 0
+    
+    if prioritize_full:
+        full_files, remaining_files = prioritize_full_files(
+            files, total_budget_chars, max_chars_per_file, full_file_budget_pct
+        )
+        
+        # Add full files first
+        for f in full_files:
+            path = f.get('path', 'unknown')
+            content = f.get('content', '') or ''
+            snippets.append(f"--- FILE: {path} (COMPLETE) ---\n{content}")
+            file_status[path] = 'full'
+            used_chars += len(content)
+        
+        # Calculate remaining budget for snippets
+        remaining_budget = total_budget_chars - used_chars
+        per_file_snippet_budget = remaining_budget // max(1, len(remaining_files)) if remaining_files else 0
+        
+        # Add snippets for remaining files
+        for f in remaining_files:
+            path = f.get('path', 'unknown')
+            content = f.get('content', '') or ''
+            
+            if not content:
+                file_status[path] = 'empty'
+                continue
+            
+            # Use the smaller of per-file budget and default max
+            budget = min(per_file_snippet_budget, snippet_max_chars)
+            snippet = select_relevant_snippet(content, path, cycle, budget)
+            
+            if snippet:
+                snippets.append(f"--- FILE: {path} (SNIPPET) ---\n{snippet}")
+                file_status[path] = 'snippet'
+                used_chars += len(snippet)
+    else:
+        # Original behavior - just use snippets
+        for f in files:
+            path = f.get('path', 'unknown')
+            content = f.get('content', '') or ''
+            
+            if not content:
+                file_status[path] = 'empty'
+                continue
+            
+            snippet = select_relevant_snippet(content, path, cycle, snippet_max_chars)
+            if snippet:
+                snippets.append(f"--- FILE: {path} ---\n{snippet}")
+                file_status[path] = 'snippet'
+    
+    return "\n\n".join(snippets), file_status
 
 
 def select_relevant_snippet(

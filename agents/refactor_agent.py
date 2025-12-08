@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from .agent_base import Agent, AgentResult
 from .llm_utils import call_llm
-from utils.snippet_selector import select_relevant_snippet
+from utils.snippet_selector import select_relevant_snippet, build_file_snippets_with_priority
 from utils.prompt_loader import load_template, safe_format
 from utils.logging import get_logger
 from utils.rag_query_builder import RAGQueryBuilder, QueryIntent
@@ -33,7 +33,20 @@ from utils.diff_utils import (
 from utils.llm_logger import (
     log_llm_call, log_llm_response, log_llm_summary, LLMCallTracker
 )
-from models.schemas import CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, RevertedFile
+# New mode imports
+from utils.scaffolding import (
+    run_scaffolding_phase, extract_scaffold_from_plan, ScaffoldResult
+)
+from utils.minimal_diff import (
+    run_minimal_diff_mode, format_minimal_diff_summary, MinimalDiffResult
+)
+from utils.roadmap_builder import (
+    RoadmapBuilder, classify_failure, build_roadmap_from_results
+)
+from models.schemas import (
+    CycleSpec, CycleDescription, RefactorProposal, Patch, ValidationReport, 
+    RevertedFile, RefactorRoadmap, ScaffoldFile, PartialAttempt
+)
 from config import RefactorConfig
 import json
 import difflib
@@ -219,6 +232,285 @@ After:
             return True
         
         return False
+
+    # =========================================================================
+    # New Refactoring Modes
+    # =========================================================================
+    
+    def _run_minimal_diff_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+    ) -> AgentResult:
+        """Run minimal diff mode - focuses on single smallest change.
+        
+        This mode:
+        1. Identifies the weakest edge in the cycle
+        2. Generates only the minimal change to break that edge
+        3. Prioritizes simple changes over complex refactoring
+        
+        Returns:
+            AgentResult with RefactorProposal (minimal)
+        """
+        logger.info("Running in MINIMAL DIFF MODE")
+        
+        # Build file snippets with full-file priority
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        # Calculate budget for file content
+        file_budget = int(self.context_window * 0.4 * 4)  # 40% of context, ~4 chars/token
+        
+        if self.refactor_config.prioritize_full_files:
+            file_snippets, file_status = build_file_snippets_with_priority(
+                files_dict,
+                cycle_dict,
+                file_budget,
+                prioritize_full=True,
+                max_chars_per_file=self.refactor_config.full_file_max_chars,
+                full_file_budget_pct=self.refactor_config.full_file_budget_pct,
+            )
+            full_count = sum(1 for s in file_status.values() if s == 'full')
+            logger.info(f"File priority: {full_count}/{len(file_status)} files included in full")
+        else:
+            snippets = []
+            for f in cycle_spec.files:
+                snippet = select_relevant_snippet(f.content or "", f.path, cycle_dict, self.max_file_chars)
+                snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+            file_snippets = "\n\n".join(snippets)
+        
+        # Run minimal diff
+        def llm_call_fn(prompt):
+            call_id = log_llm_call("refactor", "minimal_diff", prompt, {"cycle_id": cycle_spec.id})
+            response = call_llm(self.llm, prompt)
+            log_llm_response("refactor", "minimal_diff", response, call_id=call_id)
+            return response
+        
+        result = run_minimal_diff_mode(
+            cycle_dict,
+            files_dict,
+            file_snippets,
+            llm_call_fn,
+        )
+        
+        if not result.success:
+            logger.warning("Minimal diff mode failed to generate patch")
+            return AgentResult(
+                status="error",
+                output=None,
+                logs=f"Minimal diff failed: {result.raw_llm_response[:500]}"
+            )
+        
+        # Convert result to RefactorProposal
+        patches = []
+        if result.patch:
+            patch_data = result.patch
+            file_path = patch_data.get("path", "")
+            
+            # Find original content
+            original = ""
+            for f in cycle_spec.files:
+                if f.path == file_path or f.path.endswith(file_path.split('/')[-1].split('\\')[-1]):
+                    original = f.content or ""
+                    break
+            
+            # Apply the patch
+            patched = original
+            sr_list = patch_data.get("search_replace", [])
+            
+            for sr in sr_list:
+                search = sr.get("search", "")
+                replace = sr.get("replace", "")
+                if search and search in patched:
+                    patched = patched.replace(search, replace, 1)
+            
+            diff = make_unified_diff(original, patched, file_path)
+            
+            patches.append(Patch(
+                path=file_path,
+                original=original,
+                patched=patched,
+                diff=diff,
+                status="applied" if patched != original else "unchanged",
+                confidence=result.confidence,
+            ))
+        
+        # Handle new file if needed
+        if result.new_file and result.new_file.get("needed"):
+            new_path = result.new_file.get("path", "")
+            new_content = result.new_file.get("content", "")
+            patches.append(Patch(
+                path=new_path,
+                original="",
+                patched=new_content,
+                diff=f"+++ {new_path}\n{new_content}",
+                status="new_file",
+            ))
+        
+        rationale = f"Minimal diff: {result.strategy}\nTarget: {result.target_edge}\n{result.rationale}"
+        
+        proposal = RefactorProposal(
+            patches=patches,
+            rationale=rationale,
+            llm_response=result.raw_llm_response,
+        )
+        
+        logger.info(f"Minimal diff complete: {len(patches)} patches, strategy={result.strategy}")
+        return AgentResult(status="success", output=proposal.model_dump())
+
+    def _run_scaffolding_mode(
+        self,
+        cycle_spec: CycleSpec,
+        description: CycleDescription,
+        plan: Dict[str, Any],
+    ) -> Tuple[ScaffoldResult, List[Dict[str, Any]]]:
+        """Run scaffolding phase - creates interfaces/abstractions before modifying existing files.
+        
+        Args:
+            cycle_spec: The cycle specification
+            description: Cycle description from describer
+            plan: The refactoring plan from planning phase
+            
+        Returns:
+            Tuple of (ScaffoldResult, list of scaffold file info for inclusion in prompts)
+        """
+        logger.info("Running SCAFFOLDING PHASE")
+        
+        # Build file snippets for context
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        snippets = []
+        source_files = {}  # path -> content mapping for method extraction
+        for f in cycle_spec.files:
+            if f.content:
+                source_files[f.path] = f.content
+            snippet = select_relevant_snippet(f.content or "", f.path, cycle_dict, 2000)
+            snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+        file_snippets = "\n\n".join(snippets)
+        
+        # Run scaffolding with source files for enhanced method extraction
+        def llm_call_fn(prompt):
+            call_id = log_llm_call("refactor", "scaffolding", prompt, {"cycle_id": cycle_spec.id})
+            response = call_llm(self.llm, prompt)
+            log_llm_response("refactor", "scaffolding", response, call_id=call_id)
+            return response
+        
+        scaffold_result = run_scaffolding_phase(
+            plan,
+            cycle_dict,
+            file_snippets,
+            llm_call_fn,
+            validate=self.refactor_config.scaffolding_validate,
+            source_files=source_files,  # Pass source files for method extraction
+        )
+        
+        # Build scaffold info for subsequent prompts
+        scaffold_context = []
+        for sf in scaffold_result.files_created:
+            scaffold_context.append({
+                "path": sf.get("path", ""),
+                "content": sf.get("content", ""),
+                "purpose": sf.get("purpose", ""),
+                "valid": sf.get("valid", False),
+            })
+        
+        if scaffold_result.success:
+            logger.info(f"Scaffolding complete: {len(scaffold_context)} files created")
+        else:
+            logger.warning(f"Scaffolding had issues: {scaffold_result.validation_errors}")
+        
+        return scaffold_result, scaffold_context
+
+    def _build_file_snippets_with_priority(
+        self,
+        cycle_spec: CycleSpec,
+        max_budget_chars: int,
+    ) -> Tuple[str, Dict[str, str]]:
+        """Build file snippets with priority for full file inclusion.
+        
+        When files are small enough, include them in full rather than snippets.
+        This gives the LLM complete context and reduces hallucination.
+        
+        Args:
+            cycle_spec: The cycle specification
+            max_budget_chars: Maximum characters for all file content
+            
+        Returns:
+            Tuple of (combined snippets string, dict of file path -> 'full'|'snippet')
+        """
+        if not self.refactor_config.prioritize_full_files:
+            # Fall back to standard snippet selection
+            snippets = []
+            cycle_dict = cycle_spec.model_dump()
+            for f in cycle_spec.files:
+                snippet = select_relevant_snippet(f.content or "", f.path, cycle_dict, self.max_file_chars)
+                snippets.append(f"--- FILE: {f.path} ---\n{snippet}")
+            return "\n\n".join(snippets), {f.path: 'snippet' for f in cycle_spec.files}
+        
+        files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
+        cycle_dict = cycle_spec.model_dump()
+        
+        return build_file_snippets_with_priority(
+            files_dict,
+            cycle_dict,
+            max_budget_chars,
+            prioritize_full=True,
+            max_chars_per_file=self.refactor_config.full_file_max_chars,
+            full_file_budget_pct=self.refactor_config.full_file_budget_pct,
+            snippet_max_chars=self.max_file_chars,
+        )
+
+    def _build_roadmap_output(
+        self,
+        cycle_spec: CycleSpec,
+        strategy: str,
+        patch_results: List[Dict[str, Any]],
+        scaffold_result: Optional[ScaffoldResult] = None,
+        minimal_diff_result: Optional[MinimalDiffResult] = None,
+        llm_responses: List[str] = None,
+    ) -> RefactorRoadmap:
+        """Build a RefactorRoadmap for demo-friendly output.
+        
+        Args:
+            cycle_spec: The cycle specification
+            strategy: Strategy used
+            patch_results: Results from patch processing
+            scaffold_result: Results from scaffolding (if used)
+            minimal_diff_result: Results from minimal diff (if used)
+            llm_responses: Raw LLM responses
+            
+        Returns:
+            RefactorRoadmap with full progress information
+        """
+        scaffold_data = None
+        if scaffold_result:
+            scaffold_data = {
+                "files_created": scaffold_result.files_created,
+                "validation_errors": scaffold_result.validation_errors,
+            }
+        
+        minimal_diff_data = None
+        if minimal_diff_result:
+            minimal_diff_data = {
+                "target_edge": minimal_diff_result.target_edge,
+                "strategy": minimal_diff_result.strategy,
+                "patch": minimal_diff_result.patch,
+                "rationale": minimal_diff_result.rationale,
+            }
+        
+        roadmap = build_roadmap_from_results(
+            cycle_id=cycle_spec.id,
+            strategy=strategy,
+            patch_results=patch_results,
+            scaffold_results=scaffold_data,
+            minimal_diff_result=minimal_diff_data,
+            llm_responses=llm_responses or [],
+            cycle_spec=cycle_spec.model_dump(),
+        )
+        
+        return roadmap
+
     
     def _get_plan_template(self) -> Optional[str]:
         """Get the planning prompt template."""
@@ -523,6 +815,31 @@ Include 3+ lines of context in each SEARCH block.
             logger.error(f"Planning phase failed: {e}")
             return AgentResult(status="error", output=None, logs=f"Planning failed: {e}")
         
+        # =====================================================================
+        # Scaffolding Phase (if enabled and applicable)
+        # =====================================================================
+        scaffold_result = None
+        scaffold_context = []
+        
+        if (self.refactor_config.scaffolding_mode and 
+            strategy in ["interface_extraction", "dependency_inversion", "shared_module"] and
+            plan.get("new_files")):
+            
+            logger.info("Running scaffolding phase before modifying existing files...")
+            scaffold_result, scaffold_context = self._run_scaffolding_mode(
+                cycle_spec, description, plan
+            )
+            
+            if not scaffold_result.success and self.refactor_config.scaffolding_validate:
+                logger.warning("Scaffolding validation failed, continuing with caution")
+                # Don't block, but log the issues
+                for error in scaffold_result.validation_errors:
+                    logger.warning(f"Scaffold issue: {error}")
+            
+            # If scaffolding succeeded, use scaffold content instead of LLM generation
+            if scaffold_result.success and scaffold_result.files_created:
+                logger.info(f"Using {len(scaffold_result.files_created)} pre-validated scaffold files")
+        
         # Determine execution order
         execution_order = plan.get("execution_order", [])
         if not execution_order:
@@ -535,12 +852,35 @@ Include 3+ lines of context in each SEARCH block.
         previous_changes: List[Dict[str, Any]] = []
         llm_responses: List[str] = [str(plan_response)]
         
-        # Handle new files first (if any)
+        # Handle new files - use scaffold files if available, otherwise generate
         for new_file in plan.get("new_files", []):
             new_path = new_file.get("path", "")
-            if new_path:
+            if not new_path:
+                continue
+            
+            # Check if we have scaffold content for this file
+            scaffold_content = None
+            for sf in scaffold_context:
+                if sf.get("path") == new_path and sf.get("valid"):
+                    scaffold_content = sf.get("content", "")
+                    break
+            
+            if scaffold_content:
+                # Use pre-validated scaffold content
+                logger.info(f"Using scaffold content for new file: {new_path}")
+                all_inferred.append({
+                    "path": new_path,
+                    "patched": scaffold_content,
+                    "is_new_file": True,
+                    "from_scaffold": True,
+                })
+                previous_changes.append({
+                    "path": new_path,
+                    "changes_made": [f"Created {new_file.get('purpose', 'new file')} (from scaffold)"],
+                })
+            else:
+                # Generate content via LLM
                 logger.info(f"Creating new file: {new_path}")
-                # Generate content for new file
                 new_file_prompt = self._build_new_file_prompt(new_file, plan)
                 try:
                     # Log LLM call for new file
@@ -838,6 +1178,40 @@ Output ONLY the complete file content, no JSON wrapper. Start directly with the 
         
         logger.info(f"RefactorAgent completed: {changed}/{len(patches)} files changed, {reverted} reverted (atomic={atomic_proposal})")
         
+        # Build roadmap if in roadmap mode
+        roadmap = None
+        if self.refactor_config.roadmap_mode:
+            patch_results = []
+            for p in patches:
+                patch_results.append({
+                    "path": p.path,
+                    "original": p.original,
+                    "patched": p.patched,
+                    "diff": p.diff,
+                    "status": p.status,
+                    "warnings": p.warnings,
+                    "confidence": p.confidence,
+                    "revert_reason": p.revert_reason,
+                    "validation_issues": p.validation_issues,
+                })
+            
+            scaffold_data = None
+            if scaffold_result:
+                scaffold_data = {
+                    "files_created": scaffold_result.files_created,
+                    "validation_errors": scaffold_result.validation_errors,
+                }
+            
+            roadmap = self._build_roadmap_output(
+                cycle_spec=cycle_spec,
+                strategy=strategy,
+                patch_results=patch_results,
+                scaffold_result=scaffold_result,
+                llm_responses=llm_responses,
+            )
+            logger.info(f"Roadmap generated: {len(roadmap.successful_patches)} success, "
+                       f"{len(roadmap.partial_attempts)} partial")
+        
         proposal = RefactorProposal(
             patches=patches,
             reverted_files=reverted_files,
@@ -845,7 +1219,13 @@ Output ONLY the complete file content, no JSON wrapper. Start directly with the 
             llm_response=llm_response,
         )
         
-        return AgentResult(status="success", output=proposal.model_dump())
+        # Include roadmap in output if generated
+        output = proposal.model_dump()
+        if roadmap:
+            output["roadmap"] = roadmap.model_dump()
+            output["executive_summary"] = roadmap.executive_summary
+        
+        return AgentResult(status="success", output=output)
 
     def _build_prompt(self, cycle: CycleSpec, description: CycleDescription) -> str:
         """Basic prompt builder (kept for compatibility)."""
@@ -1882,6 +2262,15 @@ public class Foo : INewInterface
             validator_feedback = ValidationReport.model_validate(validator_feedback)
             logger.info(f"Retry with feedback: {len(validator_feedback.issues)} issues, {len(validator_feedback.suggestions)} suggestions")
 
+        # =====================================================================
+        # Mode Selection: Check for special modes before standard processing
+        # =====================================================================
+        
+        # Minimal diff mode - focus on single smallest change
+        if self.refactor_config.minimal_diff_mode and self.llm is not None and validator_feedback is None:
+            logger.info("Using MINIMAL DIFF MODE")
+            return self._run_minimal_diff_mode(cycle_spec, description)
+        
         # Check if we should use sequential file mode
         num_files = len(cycle_spec.files)
         use_sequential = self._should_use_sequential_mode(num_files)
@@ -2110,13 +2499,49 @@ public class Foo : INewInterface
                     ))
 
             logger.info(f"RefactorAgent completed: {files_changed}/{len(patches_out)} files changed, {len(reverted_files)} reverted (atomic={atomic_proposal})")
+            
+            # Build roadmap if in roadmap mode
+            roadmap = None
+            if self.refactor_config.roadmap_mode:
+                # Convert patch results to dict format for roadmap builder
+                patch_results = []
+                for p in patches_out:
+                    patch_results.append({
+                        "path": p.path,
+                        "original": p.original,
+                        "patched": p.patched,
+                        "diff": p.diff,
+                        "status": p.status,
+                        "warnings": p.warnings,
+                        "confidence": p.confidence,
+                        "revert_reason": p.revert_reason,
+                        "validation_issues": p.validation_issues,
+                    })
+                
+                roadmap = self._build_roadmap_output(
+                    cycle_spec=cycle_spec,
+                    strategy=strategy or "auto",
+                    patch_results=patch_results,
+                    llm_responses=[llm_response if isinstance(llm_response, str) else json.dumps(llm_response)],
+                )
+                logger.info(f"Roadmap generated: {len(roadmap.successful_patches)} success, "
+                           f"{len(roadmap.partial_attempts)} partial, "
+                           f"{len(roadmap.remaining_work)} remaining")
+            
             proposal = RefactorProposal(
                 patches=patches_out,
                 reverted_files=reverted_files,
                 rationale=f"LLM proposal using strategy: {strategy or 'auto-selected'}",
                 llm_response=llm_response if isinstance(llm_response, str) else json.dumps(llm_response),
             )
-            return AgentResult(status="success", output=proposal.model_dump())
+            
+            # Include roadmap in output if generated
+            output = proposal.model_dump()
+            if roadmap:
+                output["roadmap"] = roadmap.model_dump()
+                output["executive_summary"] = roadmap.executive_summary
+            
+            return AgentResult(status="success", output=output)
         except Exception as e:
             logger.error(f"LLM call failed: {e}", exc_info=True)
             return AgentResult(status="error", output=None, logs=f"LLM call failed: {e}")

@@ -16,7 +16,50 @@ Files: {files}
 
 ---
 
-## Output Format (JSON)
+## EXAMPLE (Interface Extraction)
+
+**Input:** Cycle between UserService.cs and OrderService.cs
+**Source:** OrderService imports UserService to call GetUserName()
+
+**Output:**
+```json
+{{
+  "reasoning": "Extract IUserService interface with GetUserName method. OrderService depends on interface.",
+  "strategy_used": "interface_extraction",
+  "new_files": [
+    {{
+      "path": "Interfaces/IUserService.cs",
+      "content": "namespace MyApp.Interfaces\\n{{\\n    public interface IUserService\\n    {{\\n        string GetUserName(int userId);\\n    }}\\n}}"
+    }}
+  ],
+  "changes": [
+    {{
+      "path": "Services/UserService.cs",
+      "prepend": "using MyApp.Interfaces;",
+      "search_replace": [
+        {{
+          "search": "namespace MyApp.Services\\n{{\\n    public class UserService",
+          "replace": "namespace MyApp.Services\\n{{\\n    public class UserService : IUserService"
+        }}
+      ]
+    }},
+    {{
+      "path": "Services/OrderService.cs",
+      "prepend": "using MyApp.Interfaces;",
+      "search_replace": [
+        {{
+          "search": "    private readonly UserService _userService;",
+          "replace": "    private readonly IUserService _userService;"
+        }}
+      ]
+    }}
+  ]
+}}
+```
+
+---
+
+## YOUR OUTPUT (JSON)
 
 ```json
 {{
@@ -52,5 +95,11 @@ Files: {files}
 ❌ BAD: Single line with no context
 
 ✅ GOOD: Create interface in `new_files` FIRST, then reference it in changes
+
+## ✓ VERIFY BEFORE OUTPUT
+
+□ Every SEARCH string exists EXACTLY in Source Code above
+□ Every new type (IFoo) is created in new_files with complete content
+□ Changes actually break the cycle (not just rename)
 
 Output ONLY JSON. No commentary.

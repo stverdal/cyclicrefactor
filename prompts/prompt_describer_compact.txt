@@ -11,6 +11,29 @@ Files: {files}
 
 ---
 
+## EXAMPLE
+
+**Input:** Cycle: ServiceA.cs → ServiceB.cs → ServiceA.cs
+
+**Output:**
+```json
+{
+  "text": "Bidirectional dependency. ServiceA imports ServiceB for logging, ServiceB imports ServiceA for config. Tight coupling prevents independent testing.",
+  "cycle_type": "bidirectional",
+  "recommended_strategy": "interface_extraction",
+  "strategy_rationale": "Extract IConfigProvider interface. ServiceB depends on interface, ServiceA implements it.",
+  "first_steps": ["Create IConfigProvider with GetConfig() method", "ServiceA implements IConfigProvider", "ServiceB uses IConfigProvider instead of ServiceA"]
+}
+```
+
+---
+
+## STRATEGY DECISION TREE
+
+1. **Two files import each other?** → `interface_extraction`
+2. **Chain A→B→C→A?** → `shared_module` (extract common code)
+3. **Lower layer imports higher?** → `dependency_inversion`
+
 ## Output (JSON)
 
 ```json
@@ -23,9 +46,8 @@ Files: {files}
 }
 ```
 
-Strategies:
-- **interface_extraction**: For A↔B bidirectional deps - create interface
-- **dependency_inversion**: For layer violations - invert with abstraction
-- **shared_module**: For transitive cycles - extract common code
+## ✓ VERIFY
+□ I identified specific imports creating the cycle
+□ My first_steps are concrete (name the interface/file to create)
 
-Be specific. Reference actual file paths. Output ONLY JSON.
+Output ONLY JSON.

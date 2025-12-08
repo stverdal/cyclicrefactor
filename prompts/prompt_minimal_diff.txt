@@ -1,0 +1,134 @@
+# Minimal Diff Mode Prompt
+# Focuses on the SINGLE smallest change needed to break the cycle
+
+You are an expert at breaking cyclic dependencies with minimal changes.
+
+## Cycle Information
+- ID: {id}
+- Dependency graph: {graph}
+
+## Weakest Edge Analysis
+The automated analysis identified this as the best edge to break:
+{weakest_edge_info}
+
+## Source Code
+{file_snippets}
+
+---
+
+## COMPLETE EXAMPLE
+
+### Example Input:
+Cycle: UserService.cs → NotificationService.cs → UserService.cs
+Weakest edge: NotificationService → UserService (only uses GetUserEmail method)
+
+Source Code:
+```csharp
+// NotificationService.cs
+using MyApp.Users;
+
+public class NotificationService
+{
+    private readonly UserService _userService;
+    
+    public void SendAlert(int userId, string message)
+    {
+        var email = _userService.GetUserEmail(userId);
+        SendEmail(email, message);
+    }
+}
+```
+
+### Example Output:
+```json
+{
+  "target_edge": {
+    "from": "NotificationService.cs",
+    "to": "UserService.cs",
+    "import_statement": "using MyApp.Users;"
+  },
+  "strategy": "parameter_injection",
+  "rationale": "NotificationService only needs the email string, not the entire UserService. Pass email as parameter.",
+  "file_to_modify": "NotificationService.cs",
+  "patch": {
+    "path": "NotificationService.cs",
+    "search_replace": [
+      {
+        "search": "    public void SendAlert(int userId, string message)\n    {\n        var email = _userService.GetUserEmail(userId);\n        SendEmail(email, message);\n    }",
+        "replace": "    public void SendAlert(string userEmail, string message)\n    {\n        SendEmail(userEmail, message);\n    }"
+      }
+    ],
+    "changes_made": ["Changed SendAlert to accept email directly instead of userId", "Removed dependency on UserService"]
+  },
+  "new_file": {
+    "needed": false
+  },
+  "remaining_cycle": "Cycle fully broken - NotificationService no longer imports UserService"
+}
+```
+
+---
+
+## Your Task: Generate the MINIMAL Change
+
+Instead of refactoring everything, focus ONLY on breaking the single weakest dependency.
+
+### REASONING STEPS (Complete each in order)
+
+**STEP 1 - LOCATE THE IMPORT**: 
+Find the exact import/using statement in the Source Code. Write it down exactly as it appears.
+
+**STEP 2 - FIND USAGES**:
+What specific methods/properties from the imported module are actually used? List them.
+
+**STEP 3 - PICK SIMPLEST FIX**:
+Choose ONE (in order of preference):
+1. **Parameter injection**: Pass the needed value as a parameter instead of importing
+2. **Lazy import**: Move the import inside the function that needs it (Python/JS only)
+3. **Callback/delegate**: Accept a function parameter instead of importing the type
+4. **Interface extraction**: Only if above options won't work
+
+**STEP 4 - VERIFY BEFORE OUTPUT**:
+□ Can I find my SEARCH text exactly in Source Code above? (If NO, fix it!)
+□ Does my change actually remove the import? (If NO, rethink!)
+
+---
+
+## Output Format (JSON)
+
+```json
+{{
+  "target_edge": {{
+    "from": "<source module>",
+    "to": "<target module>",
+    "import_statement": "<the exact import line to remove>"
+  }},
+  "strategy": "<parameter_injection|lazy_import|callback|interface_extraction>",
+  "rationale": "<why this is the minimal change>",
+  "file_to_modify": "<path to the ONE file being changed>",
+  "patch": {{
+    "path": "<file path>",
+    "search_replace": [
+      {{
+        "search": "<exact text to find - include 3+ lines context>",
+        "replace": "<replacement text>"
+      }}
+    ],
+    "changes_made": ["<description>"]
+  }},
+  "new_file": {{
+    "needed": false,
+    "path": "<only if interface extraction required>",
+    "content": "<only if new file needed>"
+  }},
+  "remaining_cycle": "<describe if cycle is fully broken or just weakened>"
+}}
+```
+
+## Guidelines
+- PREFER changes that don't require new files
+- ONE file modification is ideal
+- The change should be SMALL and OBVIOUS
+- Better to weaken the cycle than to attempt a complex full fix
+
+Output ONLY the JSON object.
