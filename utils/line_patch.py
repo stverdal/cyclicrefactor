@@ -172,6 +172,14 @@ def parse_line_patches(llm_response: str) -> List[Dict[str, Any]]:
         for p in raw_patches:
             if isinstance(p, dict) and p.get("path"):
                 patches.append(p)
+                # Log what we parsed for debugging
+                changes = p.get("changes", [])
+                logger.debug(f"Parsed patch for {p.get('path')}: {len(changes)} changes")
+                for i, c in enumerate(changes):
+                    lines = c.get("lines", [])
+                    content = c.get("new_content", c.get("content", ""))
+                    content_preview = content[:50].replace('\n', '\\n') if content else "(EMPTY)"
+                    logger.debug(f"  Change {i+1}: lines {lines}, content: {content_preview}...")
                 
     except Exception as e:
         logger.warning(f"Failed to parse line patches: {e}")
@@ -209,10 +217,26 @@ def apply_line_patches(
         for change in p.get("changes", []):
             line_range = change.get("lines", [])
             if len(line_range) >= 2:
+                new_content = change.get("new_content", change.get("content", ""))
+                
+                # Warn if replacement is empty (potential LLM mistake)
+                if not new_content or not new_content.strip():
+                    range_str = f"{line_range[0]}-{line_range[1]}"
+                    lines_being_deleted = line_range[1] - line_range[0] + 1
+                    logger.warning(
+                        f"Empty replacement for lines {range_str} ({lines_being_deleted} lines) - "
+                        f"this will DELETE the code. Description: {change.get('description', 'none')}"
+                    )
+                    # Skip empty replacements unless explicitly marked as delete
+                    if change.get("operation") != "delete" and lines_being_deleted > 1:
+                        logger.warning(f"Skipping suspicious empty replacement for {range_str}")
+                        result.warnings.append(f"Skipped empty replacement for lines {range_str}")
+                        continue
+                
                 changes.append({
                     "start": line_range[0],
                     "end": line_range[1],
-                    "content": change.get("new_content", change.get("content", "")),
+                    "content": new_content,
                     "description": change.get("description", ""),
                     "operation": "replace",
                 })

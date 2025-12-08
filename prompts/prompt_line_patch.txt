@@ -41,25 +41,26 @@ RULES:
 1. Use EXACT line numbers from the file snippets above
 2. "lines": [START, END] means replace lines START through END (inclusive)
 3. For insertions at a specific line, use "add_at_line" and "add_content"
-4. Include all replaced lines' content in "new_content"
+4. ALWAYS include replacement code in "new_content" - do NOT leave it empty unless deleting a single import line
 5. Sort multiple changes by line number for clarity
 6. Preserve indentation in new_content
 7. Only modify the target file
+8. NEVER delete multiple lines without replacement - refactoring should REPLACE code, not delete it
 
 COMMON PATTERNS:
 - Move an import from direct to lazy: change lines with the import
 - Extract interface: add import at top, change lines using the concrete type
 - Inject dependency: modify constructor lines and add parameter
 
-Example for moving import to lazy loading:
+Example for replacing a direct import with a lazy one:
 ```json
 {
   "patches": [{
     "path": "src/service.ts",
     "changes": [{
       "lines": [3, 3],
-      "new_content": "",
-      "description": "Remove direct import"
+      "new_content": "// Import moved to dynamic import below",
+      "description": "Comment out direct import (or delete single line)"
     }, {
       "lines": [25, 27],
       "new_content": "    const dep = await import('./dependency');\n    return dep.doThing(this.data);",
