@@ -27,8 +27,8 @@ DEFAULT_CONTEXT_LINES = 7
 def build_suggestion_report(
     cycle_spec: CycleSpec,
     llm_response: str,
-    strategy: str = "",
-    strategy_rationale: str = "",
+    strategy: Optional[str] = "",
+    strategy_rationale: Optional[str] = "",
     context_lines: int = DEFAULT_CONTEXT_LINES,
 ) -> SuggestionReport:
     """Build a SuggestionReport from LLM response.
@@ -36,13 +36,17 @@ def build_suggestion_report(
     Args:
         cycle_spec: The cycle specification with file contents (CycleSpec object or dict)
         llm_response: Raw LLM response (JSON or structured text)
-        strategy: The refactoring strategy used
-        strategy_rationale: Why this strategy was chosen
+        strategy: The refactoring strategy used (None will be converted to empty string)
+        strategy_rationale: Why this strategy was chosen (None will be converted to empty string)
         context_lines: Number of context lines to show before/after
         
     Returns:
         SuggestionReport ready for human review
     """
+    # Handle None values - Pydantic requires str, not None
+    strategy = strategy or ""
+    strategy_rationale = strategy_rationale or ""
+    
     # Handle dict input for backward compatibility
     if isinstance(cycle_spec, dict):
         try:

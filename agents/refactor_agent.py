@@ -477,7 +477,7 @@ After:
             report = build_suggestion_report(
                 cycle_spec=cycle_spec,  # Pass the CycleSpec object, not dict
                 llm_response=response_str,
-                strategy=strategy,
+                strategy=strategy or "",  # Ensure not None for Pydantic
                 context_lines=context_lines,
             )
             
