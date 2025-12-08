@@ -479,6 +479,7 @@ The cycle between **{node_list}** could not be automatically broken.
                     linters=getattr(self.config, "validator", {}).get("linters") if hasattr(self.config, "validator") else None,
                     test_command=getattr(self.config, "validator", {}).get("test_command") if hasattr(self.config, "validator") else None,
                     rag_service=self.rag_service,
+                    refactor_config=self.config.refactor,  # Pass refactor config for validation settings
                 )
                 # Convert proposal to RefactorProposal model if needed
                 proposal = ref_result.output

@@ -54,6 +54,7 @@ class ValidatorAgent(Agent):
         test_command: str = None,
         max_file_chars: int = 4000,
         rag_service=None,
+        refactor_config=None,
     ):
         """
         Args:
@@ -63,6 +64,7 @@ class ValidatorAgent(Agent):
             test_command: Shell command to run tests (future integration).
             max_file_chars: Truncation limit per file snippet.
             rag_service: Optional RAG service for validation criteria.
+            refactor_config: Optional RefactorConfig with validation settings.
         """
         self.llm = llm
         self.prompt_template = prompt_template
@@ -71,6 +73,15 @@ class ValidatorAgent(Agent):
         self.max_file_chars = max_file_chars
         self.rag_service = rag_service
         self.query_builder = RAGQueryBuilder()
+        self.refactor_config = refactor_config
+        
+        # Extract validation settings from config
+        if refactor_config:
+            self.rule_based_validation = getattr(refactor_config, 'rule_based_validation', True)
+            self.block_on_validation_failure = getattr(refactor_config, 'block_on_validation_failure', True)
+        else:
+            self.rule_based_validation = True
+            self.block_on_validation_failure = True
 
     # -------------------------------------------------------------------------
     # Prompt building
@@ -667,9 +678,14 @@ You must analyze the code changes (diffs) below to determine whether they succes
 
         logger.debug(f"Validating proposal with {len(proposal.patches)} patches")
 
-        # Rule-based checks first
-        rule_issues, observations = self._rule_based_checks(cycle_spec, proposal)
-        logger.debug(f"Rule-based checks found {len(rule_issues)} issues, {len(observations)} observations")
+        # Rule-based checks (if enabled)
+        rule_issues = []
+        observations = []
+        if self.rule_based_validation:
+            rule_issues, observations = self._rule_based_checks(cycle_spec, proposal)
+            logger.debug(f"Rule-based checks found {len(rule_issues)} issues, {len(observations)} observations")
+        else:
+            logger.info("Rule-based validation DISABLED by config (rule_based_validation=False)")
 
         # If no LLM, return rule-based result with actionable suggestions
         if self.llm is None:

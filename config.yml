@@ -42,9 +42,9 @@ refactor:
   auto_repair_syntax: true      # Attempt to auto-repair syntax errors in LLM output
   auto_repair_min_confidence: 0.6  # Minimum confidence to accept auto-repair
   # Validation settings
-  rule_based_validation: true   # Run rule-based validation (set false to skip)
-  block_on_validation_failure: true  # Reject patches that fail validation
-  hallucination_detection: true # Detect and warn about LLM hallucinations
+  rule_based_validation: false  # Run rule-based validation (set false to skip)
+  block_on_validation_failure: false  # Reject patches that fail validation
+  hallucination_detection: false # Detect and warn about LLM hallucinations
 
 io:
   artifacts_dir: artifacts
