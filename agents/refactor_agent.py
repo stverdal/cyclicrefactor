@@ -474,11 +474,21 @@ After:
             
             # Build suggestion report from LLM response
             context_lines = self.refactor_config.suggestion_context_lines
+            
+            # Get LLM model/provider info for diagnostics
+            llm_model = getattr(self.llm, 'model', '') or getattr(self.llm, 'model_name', '') or ''
+            llm_provider = getattr(self.llm, 'provider', '') or ''
+            if hasattr(self.llm, '__class__'):
+                llm_provider = llm_provider or self.llm.__class__.__name__
+            
             report = build_suggestion_report(
                 cycle_spec=cycle_spec,  # Pass the CycleSpec object, not dict
                 llm_response=response_str,
                 strategy=strategy or "",  # Ensure not None for Pydantic
                 context_lines=context_lines,
+                llm_model=llm_model,
+                llm_provider=llm_provider,
+                generation_time_ms=int(llm_duration),
             )
             
             # Add validation
@@ -556,6 +566,7 @@ Output ONLY the JSON.
         self,
         cycle_spec: CycleSpec,
         description: CycleDescription,
+        validator_feedback: Optional[ValidationReport] = None,
     ) -> AgentResult:
         """Run line-based patching mode - uses line numbers instead of SEARCH/REPLACE.
         
@@ -570,10 +581,16 @@ Output ONLY the JSON.
         - Better error messages with exact line numbers
         - Handles partial LLM output gracefully
         
+        Args:
+            cycle_spec: The cycle specification
+            description: The cycle description from describer
+            validator_feedback: Optional feedback from previous validation (for retries)
+        
         Returns:
             AgentResult with RefactorProposal
         """
-        logger.info("Running in LINE-BASED PATCH MODE")
+        is_retry = validator_feedback is not None
+        logger.info(f"Running in LINE-BASED PATCH MODE (retry={is_retry})")
         
         # Build file dicts with content
         files_dict = [{"path": f.path, "content": f.content} for f in cycle_spec.files]
@@ -598,6 +615,29 @@ Output ONLY the JSON.
         # Get pattern example (brief for this mode)
         pattern_example = self._get_pattern_example(strategy)
         
+        # Build feedback section if this is a retry
+        feedback_section = ""
+        if validator_feedback:
+            feedback_issues = []
+            for issue in validator_feedback.issues[:5]:  # Limit to top 5 issues
+                if hasattr(issue, 'comment'):
+                    feedback_issues.append(f"- {issue.comment}")
+                elif isinstance(issue, dict):
+                    feedback_issues.append(f"- {issue.get('comment', str(issue))}")
+                else:
+                    feedback_issues.append(f"- {str(issue)}")
+            
+            feedback_section = f"""
+## IMPORTANT: Previous Attempt Failed
+
+Your previous patch attempt had validation issues. Please address these:
+
+{chr(10).join(feedback_issues)}
+
+Ensure your line numbers are exact and match the numbered content below.
+"""
+            logger.info(f"Including {len(feedback_issues)} validation issues in retry prompt")
+        
         # Load line-patch prompt template
         line_patch_template = load_template("prompts/prompt_line_patch.txt")
         if line_patch_template:
@@ -611,11 +651,13 @@ Output ONLY the JSON.
                 target_file=cycle_spec.files[0].path if cycle_spec.files else "unknown",
                 patterns=pattern_example,
                 file_content=numbered_snippets,
+                feedback=feedback_section,  # Add feedback placeholder
             )
         else:
             # Fallback inline prompt
             prompt_text = self._build_line_patch_prompt_fallback(
-                cycle_spec, description, numbered_snippets, strategy, pattern_example
+                cycle_spec, description, numbered_snippets, strategy, pattern_example,
+                feedback_section=feedback_section
             )
         
         # Enforce prompt budget
@@ -737,6 +779,7 @@ Output ONLY the JSON.
         numbered_snippets: str,
         strategy: Optional[str],
         pattern_example: str,
+        feedback_section: str = "",
     ) -> str:
         """Build fallback line-patch prompt if template not found."""
         return f"""You are refactoring code to break a cyclic dependency.
@@ -748,7 +791,7 @@ Output ONLY the JSON.
 
 ## Problem Description
 {description.text}
-
+{feedback_section}
 ## Recommended Strategy: {strategy or 'Choose the most appropriate'}
 
 {pattern_example}
@@ -2979,14 +3022,19 @@ public class Foo : INewInterface
         # =====================================================================
         
         # Suggestion mode - output suggestions for human review without applying patches
+        # Only on first run (no validator feedback) since suggestions don't need retries
         if self.refactor_config.suggestion_mode and self.llm is not None and validator_feedback is None:
             logger.info("Using SUGGESTION MODE")
             return self._run_suggestion_mode(cycle_spec, description)
         
         # Line-based patching mode - uses line numbers instead of text matching
-        if self.refactor_config.line_based_patching and self.llm is not None and validator_feedback is None:
-            logger.info("Using LINE-BASED PATCH MODE")
-            return self._run_line_patch_mode(cycle_spec, description)
+        # This mode DOES support retries with validator feedback
+        if self.refactor_config.line_based_patching and self.llm is not None:
+            if validator_feedback is not None:
+                logger.info("Using LINE-BASED PATCH MODE (retry with feedback)")
+            else:
+                logger.info("Using LINE-BASED PATCH MODE")
+            return self._run_line_patch_mode(cycle_spec, description, validator_feedback)
         
         # Minimal diff mode - focus on single smallest change
         if self.refactor_config.minimal_diff_mode and self.llm is not None and validator_feedback is None:

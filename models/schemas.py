@@ -544,6 +544,11 @@ class CodeChange(BaseModel):
     original_code: str = ""
     suggested_code: str = ""
     change_type: str = "modify"  # "modify", "add", "remove"
+    
+    # Additional context for operators
+    why_needed: str = ""  # Specific reason this change breaks the cycle
+    potential_issues: List[str] = Field(default_factory=list)  # What could go wrong
+    dependencies: List[str] = Field(default_factory=list)  # Other changes this depends on
 
 
 class RefactorSuggestion(BaseModel):
@@ -567,6 +572,16 @@ class RefactorSuggestion(BaseModel):
     confidence: float = 1.0  # 0-1 confidence this will work
     validation_notes: List[str] = Field(default_factory=list)
     
+    # Operator guidance
+    manual_steps: List[str] = Field(default_factory=list)  # Step-by-step instructions
+    copy_paste_ready: str = ""  # Code ready to copy-paste
+    testing_notes: str = ""  # How to verify this change works
+    rollback_instructions: str = ""  # How to undo if needed
+    
+    # Failure prevention
+    common_mistakes: List[str] = Field(default_factory=list)  # Pitfalls to avoid
+    prerequisites: List[str] = Field(default_factory=list)  # What must be done first
+    
     @field_validator("changes", mode="before")
     @classmethod
     def convert_change_dicts(cls, v):
@@ -585,8 +600,65 @@ class SuggestionValidation(BaseModel):
     errors: List[str] = Field(default_factory=list)
 
 
+class CycleContext(BaseModel):
+    """Context about the cycle being addressed - helps operators understand the problem."""
+    nodes: List[str] = Field(default_factory=list)  # Files/modules in the cycle
+    edges: List[Dict[str, str]] = Field(default_factory=list)  # Dependency edges
+    cycle_type: str = ""  # "bidirectional", "transitive", "multi-node"
+    hotspot_file: str = ""  # The file that appears in most dependencies
+    breaking_edge: str = ""  # The specific edge to break (if identified)
+    dependency_description: str = ""  # Human-readable description of the cycle
+
+
+class FailurePattern(BaseModel):
+    """Detected failure pattern with remediation guidance."""
+    pattern_type: str = ""  # "search_mismatch", "hallucination", "syntax_error", etc.
+    description: str = ""
+    affected_files: List[str] = Field(default_factory=list)
+    likely_cause: str = ""
+    remediation: str = ""  # What to do about it
+    evidence: List[str] = Field(default_factory=list)  # Specific evidence
+
+
+class OperatorGuidance(BaseModel):
+    """Actionable guidance for the human operator."""
+    executive_summary: str = ""  # TL;DR for busy operators
+    difficulty_rating: str = "easy"  # "easy", "moderate", "complex", "expert"
+    estimated_time: str = ""  # "5 minutes", "30 minutes", etc.
+    prerequisites: List[str] = Field(default_factory=list)  # What to do before starting
+    step_by_step: List[str] = Field(default_factory=list)  # Ordered instructions
+    verification_steps: List[str] = Field(default_factory=list)  # How to verify success
+    common_pitfalls: List[str] = Field(default_factory=list)  # Things that often go wrong
+    when_to_escalate: str = ""  # When to ask for help
+    alternative_approaches: List[str] = Field(default_factory=list)  # Other ways to solve
+
+
+class DiagnosticInfo(BaseModel):
+    """Diagnostic information for troubleshooting."""
+    llm_model: str = ""
+    llm_provider: str = ""
+    prompt_tokens: int = 0
+    response_tokens: int = 0
+    generation_time_ms: int = 0
+    pipeline_version: str = ""
+    timestamp: str = ""
+    config_snapshot: Dict[str, Any] = Field(default_factory=dict)  # Relevant config
+
+
 class SuggestionReport(BaseModel):
-    """Complete suggestion report - the output of suggestion mode."""
+    """Complete suggestion report - the output of suggestion mode.
+    
+    This is designed to be a ONE-STOP-SHOP for operators, containing:
+    - What the cycle is and why it's problematic
+    - What the LLM suggests doing about it
+    - Step-by-step instructions for manual application
+    - Failure patterns and how to avoid them
+    - Verification and rollback guidance
+    
+    Note: This differs from RefactorRoadmap which is a POST-MORTEM of an 
+    actual refactoring attempt (what succeeded, what failed). SuggestionReport
+    is BEFORE any changes are applied - it's the plan, not the execution report.
+    """
     cycle_id: str = ""
     strategy: str = ""
     strategy_rationale: str = ""
@@ -611,6 +683,26 @@ class SuggestionReport(BaseModel):
     # Raw LLM output for debugging
     llm_response: str = ""
     
+    # === NEW: Operator-friendly additions ===
+    
+    # Cycle context - understand the problem
+    cycle_context: Optional[CycleContext] = None
+    
+    # Failure patterns detected (from validation or LLM analysis)
+    failure_patterns: List[FailurePattern] = Field(default_factory=list)
+    
+    # Actionable operator guidance
+    operator_guidance: Optional[OperatorGuidance] = None
+    
+    # Diagnostic info for troubleshooting
+    diagnostics: Optional[DiagnosticInfo] = None
+    
+    # Quick-reference sections
+    files_to_create: List[str] = Field(default_factory=list)  # New files
+    files_to_modify: List[str] = Field(default_factory=list)  # Existing files
+    imports_to_add: List[Dict[str, str]] = Field(default_factory=list)  # {file, import}
+    imports_to_remove: List[Dict[str, str]] = Field(default_factory=list)  # {file, import}
+    
     @field_validator("suggestions", mode="before")
     @classmethod
     def convert_suggestion_dicts(cls, v):
@@ -618,90 +710,474 @@ class SuggestionReport(BaseModel):
             return [RefactorSuggestion(**s) if isinstance(s, dict) else s for s in v]
         return v
     
+    @field_validator("failure_patterns", mode="before")
+    @classmethod
+    def convert_failure_pattern_dicts(cls, v):
+        if isinstance(v, list):
+            return [FailurePattern(**p) if isinstance(p, dict) else p for p in v]
+        return v
+    
     def to_markdown(self) -> str:
-        """Generate a markdown report for human review."""
-        lines = [
-            f"# Refactoring Suggestions for Cycle: {self.cycle_id}",
-            "",
-            "## Summary",
-            f"**Strategy:** {self.strategy}",
-            f"**Rationale:** {self.strategy_rationale}",
-            f"**Confidence:** {self.confidence:.0%}",
-            f"**Cycle will be broken:** {'✓ Yes' if self.cycle_will_be_broken else '✗ Needs verification'}",
-            "",
-        ]
+        """Generate a comprehensive markdown report for human operators.
         
-        # Validation status
+        This is designed to be a ONE-STOP-SHOP containing everything an
+        operator needs to understand and implement the refactoring.
+        """
+        lines = []
+        
+        # =================================================================
+        # HEADER & EXECUTIVE SUMMARY
+        # =================================================================
+        lines.extend([
+            f"# 🔄 Refactoring Suggestions: {self.cycle_id}",
+            "",
+        ])
+        
+        # Executive summary if available
+        if self.operator_guidance and self.operator_guidance.executive_summary:
+            lines.extend([
+                "## 📋 Executive Summary",
+                "",
+                self.operator_guidance.executive_summary,
+                "",
+                f"**Difficulty:** {self.operator_guidance.difficulty_rating.upper()}",
+                f"**Estimated Time:** {self.operator_guidance.estimated_time or 'Not estimated'}",
+                "",
+            ])
+        
+        # Quick stats
+        lines.extend([
+            "## 📊 Overview",
+            "",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Strategy | {self.strategy or 'Not specified'} |",
+            f"| Confidence | {self.confidence:.0%} |",
+            f"| Cycle Broken | {'✅ Yes' if self.cycle_will_be_broken else '❓ Needs verification'} |",
+            f"| Files to Create | {len(self.files_to_create)} |",
+            f"| Files to Modify | {len(self.files_to_modify)} |",
+            f"| Total Suggestions | {len(self.suggestions)} |",
+            "",
+        ])
+        
+        if self.strategy_rationale:
+            lines.extend([
+                f"**Rationale:** {self.strategy_rationale}",
+                "",
+            ])
+        
+        # =================================================================
+        # CYCLE CONTEXT - Understanding the Problem
+        # =================================================================
+        if self.cycle_context:
+            ctx = self.cycle_context
+            lines.extend([
+                "---",
+                "## 🔍 Understanding the Cycle",
+                "",
+            ])
+            
+            if ctx.dependency_description:
+                lines.extend([ctx.dependency_description, ""])
+            
+            if ctx.nodes:
+                lines.append("**Files Involved:**")
+                for node in ctx.nodes:
+                    lines.append(f"- `{node}`")
+                lines.append("")
+            
+            if ctx.cycle_type:
+                lines.append(f"**Cycle Type:** {ctx.cycle_type}")
+            if ctx.hotspot_file:
+                lines.append(f"**Hotspot File:** `{ctx.hotspot_file}` (appears in most dependencies)")
+            if ctx.breaking_edge:
+                lines.append(f"**Edge to Break:** {ctx.breaking_edge}")
+            lines.append("")
+            
+            if ctx.edges:
+                lines.extend([
+                    "**Dependency Graph:**",
+                    "```",
+                ])
+                for edge in ctx.edges:
+                    source = edge.get("source", edge.get("from", "?"))
+                    target = edge.get("target", edge.get("to", "?"))
+                    lines.append(f"  {source} → {target}")
+                lines.extend(["```", ""])
+        
+        # =================================================================
+        # QUICK REFERENCE - What Changes at a Glance
+        # =================================================================
+        lines.extend([
+            "---",
+            "## ⚡ Quick Reference",
+            "",
+        ])
+        
+        if self.files_to_create:
+            lines.append("**New Files to Create:**")
+            for f in self.files_to_create:
+                lines.append(f"- 📄 `{f}`")
+            lines.append("")
+        
+        if self.files_to_modify:
+            lines.append("**Files to Modify:**")
+            for f in self.files_to_modify:
+                lines.append(f"- ✏️ `{f}`")
+            lines.append("")
+        
+        if self.imports_to_add:
+            lines.append("**Imports to Add:**")
+            for imp in self.imports_to_add:
+                lines.append(f"- In `{imp.get('file', '?')}`: `{imp.get('import', '?')}`")
+            lines.append("")
+        
+        if self.imports_to_remove:
+            lines.append("**Imports to Remove:**")
+            for imp in self.imports_to_remove:
+                lines.append(f"- From `{imp.get('file', '?')}`: ~~`{imp.get('import', '?')}`~~")
+            lines.append("")
+        
+        # =================================================================
+        # RECOMMENDED ORDER
+        # =================================================================
+        if self.suggested_order:
+            lines.extend([
+                "---",
+                "## 📝 Recommended Order of Changes",
+                "",
+                "Apply changes in this order to minimize issues:",
+                "",
+            ])
+            for i, path in enumerate(self.suggested_order, 1):
+                lines.append(f"{i}. `{path}`")
+            lines.append("")
+        
+        # =================================================================
+        # OPERATOR GUIDANCE - Step by Step
+        # =================================================================
+        if self.operator_guidance:
+            og = self.operator_guidance
+            
+            if og.prerequisites:
+                lines.extend([
+                    "---",
+                    "## ⚠️ Before You Start",
+                    "",
+                ])
+                for prereq in og.prerequisites:
+                    lines.append(f"- [ ] {prereq}")
+                lines.append("")
+            
+            if og.step_by_step:
+                lines.extend([
+                    "---",
+                    "## 📋 Step-by-Step Instructions",
+                    "",
+                ])
+                for i, step in enumerate(og.step_by_step, 1):
+                    lines.append(f"{i}. {step}")
+                lines.append("")
+            
+            if og.common_pitfalls:
+                lines.extend([
+                    "### ⚠️ Common Pitfalls to Avoid",
+                    "",
+                ])
+                for pitfall in og.common_pitfalls:
+                    lines.append(f"- ❌ {pitfall}")
+                lines.append("")
+        
+        # =================================================================
+        # VALIDATION STATUS
+        # =================================================================
         if self.validation:
-            lines.append("## Validation")
+            lines.extend([
+                "---",
+                "## ✅ Validation Status",
+                "",
+            ])
             if self.validation.cycle_logically_broken:
-                lines.append("- ✓ Cycle logically broken by these changes")
+                lines.append("- ✅ Cycle logically broken by these changes")
             if self.validation.types_exist:
-                lines.append("- ✓ All referenced types exist")
+                lines.append("- ✅ All referenced types exist")
             if self.validation.no_hallucinations_detected:
-                lines.append("- ✓ No hallucinations detected")
+                lines.append("- ✅ No hallucinations detected")
             for warning in self.validation.warnings:
                 lines.append(f"- ⚠️ {warning}")
             for error in self.validation.errors:
                 lines.append(f"- ❌ {error}")
             lines.append("")
         
-        # Suggested order
-        if self.suggested_order:
-            lines.append("## Recommended Order")
-            for i, path in enumerate(self.suggested_order, 1):
-                lines.append(f"{i}. `{path}`")
-            lines.append("")
+        # =================================================================
+        # FAILURE PATTERNS (if any detected)
+        # =================================================================
+        if self.failure_patterns:
+            lines.extend([
+                "---",
+                "## 🚨 Detected Issues & Remediation",
+                "",
+            ])
+            for pattern in self.failure_patterns:
+                lines.extend([
+                    f"### {pattern.pattern_type.replace('_', ' ').title()}",
+                    "",
+                    f"**Description:** {pattern.description}",
+                    "",
+                ])
+                if pattern.affected_files:
+                    lines.append("**Affected Files:**")
+                    for f in pattern.affected_files[:5]:
+                        lines.append(f"- `{f}`")
+                    lines.append("")
+                if pattern.likely_cause:
+                    lines.append(f"**Likely Cause:** {pattern.likely_cause}")
+                    lines.append("")
+                if pattern.remediation:
+                    lines.append(f"**How to Fix:** {pattern.remediation}")
+                    lines.append("")
+                if pattern.evidence:
+                    lines.append("**Evidence:**")
+                    for ev in pattern.evidence[:3]:
+                        lines.append(f"- {ev}")
+                    lines.append("")
         
-        # Each suggestion
+        # =================================================================
+        # DETAILED SUGGESTIONS
+        # =================================================================
+        lines.extend([
+            "---",
+            "## 📝 Detailed Suggestions",
+            "",
+        ])
+        
         for i, suggestion in enumerate(self.suggestions, 1):
-            lines.append("---")
-            lines.append(f"## Suggestion {i}: {suggestion.title}")
-            lines.append("")
-            lines.append(f"**File:** `{suggestion.file_path}`")
-            lines.append("")
-            lines.append(f"**Explanation:** {suggestion.explanation}")
-            lines.append("")
+            lines.extend([
+                "---",
+                f"### Suggestion {i}: {suggestion.title}",
+                "",
+                f"**File:** `{suggestion.file_path}`",
+                f"**Confidence:** {suggestion.confidence:.0%}",
+                "",
+            ])
             
+            if suggestion.explanation:
+                lines.extend([f"**Explanation:** {suggestion.explanation}", ""])
+            
+            # Prerequisites for this suggestion
+            if suggestion.prerequisites:
+                lines.append("**Prerequisites:**")
+                for prereq in suggestion.prerequisites:
+                    lines.append(f"- {prereq}")
+                lines.append("")
+            
+            # The actual changes
             if suggestion.is_new_file:
-                lines.append("### New File Content")
-                lines.append("```")
-                lines.append(suggestion.new_file_content)
-                lines.append("```")
+                lines.extend([
+                    "#### New File Content",
+                    "",
+                    "Create this file with the following content:",
+                    "",
+                    "```",
+                    suggestion.new_file_content,
+                    "```",
+                    "",
+                ])
+                
+                # Copy-paste ready
+                if suggestion.copy_paste_ready:
+                    lines.extend([
+                        "**Copy-Paste Ready:**",
+                        "```",
+                        suggestion.copy_paste_ready,
+                        "```",
+                        "",
+                    ])
             else:
-                for change in suggestion.changes:
+                for j, change in enumerate(suggestion.changes, 1):
+                    if len(suggestion.changes) > 1:
+                        lines.append(f"#### Change {j}")
+                    
                     if change.line_start > 0:
                         lines.append(f"**Location:** Lines {change.line_start}-{change.line_end}")
-                    lines.append("")
-                    lines.append("**Current Code:**")
-                    lines.append("```")
-                    lines.append(change.original_code)
-                    lines.append("```")
-                    lines.append("")
-                    lines.append("**Suggested Change:**")
-                    lines.append("```")
-                    lines.append(change.suggested_code)
-                    lines.append("```")
+                    
+                    if change.why_needed:
+                        lines.append(f"**Why:** {change.why_needed}")
+                    
+                    lines.extend([
+                        "",
+                        "**Find this code:**",
+                        "```",
+                        change.original_code,
+                        "```",
+                        "",
+                        "**Replace with:**",
+                        "```",
+                        change.suggested_code,
+                        "```",
+                        "",
+                    ])
+                    
+                    if change.potential_issues:
+                        lines.append("**⚠️ Watch out for:**")
+                        for issue in change.potential_issues:
+                            lines.append(f"- {issue}")
+                        lines.append("")
+                    
+                    if change.dependencies:
+                        lines.append("**Dependencies:**")
+                        for dep in change.dependencies:
+                            lines.append(f"- {dep}")
+                        lines.append("")
             
-            if suggestion.validation_notes:
+            # Manual steps
+            if suggestion.manual_steps:
+                lines.append("**Step-by-Step:**")
+                for step in suggestion.manual_steps:
+                    lines.append(f"1. {step}")
                 lines.append("")
-                lines.append("**Notes:**")
+            
+            # Testing notes
+            if suggestion.testing_notes:
+                lines.extend([
+                    "**How to Verify:**",
+                    suggestion.testing_notes,
+                    "",
+                ])
+            
+            # Common mistakes for this suggestion
+            if suggestion.common_mistakes:
+                lines.append("**Common Mistakes:**")
+                for mistake in suggestion.common_mistakes:
+                    lines.append(f"- ❌ {mistake}")
+                lines.append("")
+            
+            # Validation notes
+            if suggestion.validation_notes:
+                lines.append("**Validation Notes:**")
                 for note in suggestion.validation_notes:
                     lines.append(f"- {note}")
+                lines.append("")
             
+            # Rollback
+            if suggestion.rollback_instructions:
+                lines.extend([
+                    "**Rollback Instructions:**",
+                    suggestion.rollback_instructions,
+                    "",
+                ])
+        
+        # =================================================================
+        # VERIFICATION STEPS
+        # =================================================================
+        if self.operator_guidance and self.operator_guidance.verification_steps:
+            lines.extend([
+                "---",
+                "## ✅ Verification Steps",
+                "",
+                "After applying all changes, verify success:",
+                "",
+            ])
+            for i, step in enumerate(self.operator_guidance.verification_steps, 1):
+                lines.append(f"{i}. [ ] {step}")
             lines.append("")
         
-        # Warnings and notes
+        # =================================================================
+        # WARNINGS AND NOTES
+        # =================================================================
         if self.warnings:
-            lines.append("---")
-            lines.append("## Warnings")
+            lines.extend([
+                "---",
+                "## ⚠️ Warnings",
+                "",
+            ])
             for warning in self.warnings:
                 lines.append(f"- ⚠️ {warning}")
             lines.append("")
         
         if self.notes:
-            lines.append("## Additional Notes")
+            lines.extend([
+                "## 📌 Additional Notes",
+                "",
+            ])
             for note in self.notes:
                 lines.append(f"- {note}")
+            lines.append("")
+        
+        # =================================================================
+        # ALTERNATIVE APPROACHES
+        # =================================================================
+        if self.operator_guidance and self.operator_guidance.alternative_approaches:
+            lines.extend([
+                "---",
+                "## 🔀 Alternative Approaches",
+                "",
+                "If the suggested approach doesn't work, consider:",
+                "",
+            ])
+            for alt in self.operator_guidance.alternative_approaches:
+                lines.append(f"- {alt}")
+            lines.append("")
+        
+        # When to escalate
+        if self.operator_guidance and self.operator_guidance.when_to_escalate:
+            lines.extend([
+                "## 🆘 When to Escalate",
+                "",
+                self.operator_guidance.when_to_escalate,
+                "",
+            ])
+        
+        # =================================================================
+        # DIAGNOSTICS (collapsible for troubleshooting)
+        # =================================================================
+        if self.diagnostics:
+            diag = self.diagnostics
+            lines.extend([
+                "---",
+                "<details>",
+                "<summary>🔧 Diagnostics (click to expand)</summary>",
+                "",
+                "| Property | Value |",
+                "|----------|-------|",
+                f"| LLM Model | {diag.llm_model or 'N/A'} |",
+                f"| LLM Provider | {diag.llm_provider or 'N/A'} |",
+                f"| Prompt Tokens | {diag.prompt_tokens} |",
+                f"| Response Tokens | {diag.response_tokens} |",
+                f"| Generation Time | {diag.generation_time_ms}ms |",
+                f"| Pipeline Version | {diag.pipeline_version or 'N/A'} |",
+                f"| Timestamp | {diag.timestamp or 'N/A'} |",
+                "",
+            ])
+            if diag.config_snapshot:
+                lines.append("**Config Snapshot:**")
+                lines.append("```json")
+                import json
+                lines.append(json.dumps(diag.config_snapshot, indent=2))
+                lines.append("```")
+            lines.extend([
+                "",
+                "</details>",
+                "",
+            ])
+        
+        # =================================================================
+        # RAW LLM RESPONSE (collapsible for debugging)
+        # =================================================================
+        if self.llm_response:
+            lines.extend([
+                "<details>",
+                "<summary>🤖 Raw LLM Response (click to expand)</summary>",
+                "",
+                "```",
+                self.llm_response[:5000],
+            ])
+            if len(self.llm_response) > 5000:
+                lines.append(f"... ({len(self.llm_response) - 5000} more characters)")
+            lines.extend([
+                "```",
+                "",
+                "</details>",
+            ])
         
         return "\n".join(lines)

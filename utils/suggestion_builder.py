@@ -2,12 +2,21 @@
 
 This module builds suggestions from LLM output without trying to apply patches.
 It provides rich context and explanations for human review.
+
+This produces a ONE-STOP-SHOP SuggestionReport containing:
+- Cycle context (what's the problem)
+- LLM suggestions (what to do about it)
+- Operator guidance (step-by-step instructions)
+- Failure patterns (what might go wrong)
+- Quick reference (files to create/modify, imports to change)
+- Diagnostics (for troubleshooting)
 """
 
 import re
 import json
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from datetime import datetime
 
 from models.schemas import (
     CycleSpec, 
@@ -15,6 +24,10 @@ from models.schemas import (
     CodeChange, 
     SuggestionReport,
     SuggestionValidation,
+    CycleContext,
+    OperatorGuidance,
+    DiagnosticInfo,
+    FailurePattern,
 )
 from utils.logging import get_logger
 
@@ -30,8 +43,13 @@ def build_suggestion_report(
     strategy: Optional[str] = "",
     strategy_rationale: Optional[str] = "",
     context_lines: int = DEFAULT_CONTEXT_LINES,
+    llm_model: str = "",
+    llm_provider: str = "",
+    generation_time_ms: int = 0,
 ) -> SuggestionReport:
-    """Build a SuggestionReport from LLM response.
+    """Build a comprehensive SuggestionReport from LLM response.
+    
+    This builds a ONE-STOP-SHOP report containing everything an operator needs.
     
     Args:
         cycle_spec: The cycle specification with file contents (CycleSpec object or dict)
@@ -39,6 +57,9 @@ def build_suggestion_report(
         strategy: The refactoring strategy used (None will be converted to empty string)
         strategy_rationale: Why this strategy was chosen (None will be converted to empty string)
         context_lines: Number of context lines to show before/after
+        llm_model: The LLM model used (for diagnostics)
+        llm_provider: The LLM provider (for diagnostics)
+        generation_time_ms: Time taken to generate response (for diagnostics)
         
     Returns:
         SuggestionReport ready for human review
@@ -69,10 +90,29 @@ def build_suggestion_report(
         llm_response=llm_response,
     )
     
+    # Build cycle context
+    report.cycle_context = _build_cycle_context(cycle_spec)
+    
+    # Build diagnostics
+    report.diagnostics = DiagnosticInfo(
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+        generation_time_ms=generation_time_ms,
+        timestamp=datetime.now().isoformat(),
+    )
+    
     # Parse LLM response
     parsed = _parse_llm_response(llm_response)
     if not parsed:
         report.warnings.append("Could not parse LLM response")
+        report.failure_patterns.append(FailurePattern(
+            pattern_type="parse_error",
+            description="Could not parse LLM response as JSON",
+            likely_cause="LLM may have returned malformed JSON or non-JSON text",
+            remediation="Check the raw LLM response at the bottom of this report and manually extract the suggested changes",
+        ))
+        # Add basic operator guidance even on parse failure
+        report.operator_guidance = _build_fallback_guidance(cycle_spec, llm_response)
         return report
     
     # Extract strategy if not provided
@@ -85,10 +125,11 @@ def build_suggestion_report(
     
     # Build suggestions from new_files
     for new_file in parsed.get("new_files", []):
-        suggestion = _build_new_file_suggestion(new_file)
+        suggestion = _build_new_file_suggestion(new_file, cycle_spec)
         if suggestion:
             report.suggestions.append(suggestion)
             report.suggested_order.append(suggestion.file_path)
+            report.files_to_create.append(suggestion.file_path)
     
     # Build suggestions from changes/patches
     for change in parsed.get("changes", parsed.get("patches", [])):
@@ -101,11 +142,222 @@ def build_suggestion_report(
             report.suggestions.append(suggestion)
             if suggestion.file_path not in report.suggested_order:
                 report.suggested_order.append(suggestion.file_path)
+            if suggestion.file_path not in report.files_to_modify:
+                report.files_to_modify.append(suggestion.file_path)
+            
+            # Extract import changes
+            _extract_import_changes(suggestion, report)
     
     # Calculate confidence based on completeness
     report.confidence = _calculate_confidence(report, parsed)
     
+    # Build comprehensive operator guidance
+    report.operator_guidance = _build_operator_guidance(report, cycle_spec, strategy)
+    
     return report
+
+
+def _build_cycle_context(cycle_spec: CycleSpec) -> CycleContext:
+    """Build context about the cycle for operator understanding."""
+    ctx = CycleContext(
+        nodes=list(cycle_spec.graph.nodes) if cycle_spec.graph else [],
+    )
+    
+    # Build edges
+    if cycle_spec.graph and cycle_spec.graph.edges:
+        ctx.edges = [
+            {"source": e.source, "target": e.target}
+            for e in cycle_spec.graph.edges
+        ]
+    
+    # Determine cycle type
+    node_count = len(ctx.nodes)
+    if node_count == 2:
+        ctx.cycle_type = "bidirectional"
+        ctx.dependency_description = f"Files `{ctx.nodes[0]}` and `{ctx.nodes[1]}` depend on each other directly."
+    elif node_count == 3:
+        ctx.cycle_type = "triangle"
+        ctx.dependency_description = f"A three-way dependency cycle exists between {', '.join(f'`{n}`' for n in ctx.nodes)}."
+    else:
+        ctx.cycle_type = "multi-node"
+        ctx.dependency_description = f"A complex dependency cycle involving {node_count} files."
+    
+    # Find hotspot (most connected node)
+    if ctx.edges:
+        node_counts: Dict[str, int] = {}
+        for edge in ctx.edges:
+            node_counts[edge["source"]] = node_counts.get(edge["source"], 0) + 1
+            node_counts[edge["target"]] = node_counts.get(edge["target"], 0) + 1
+        if node_counts:
+            ctx.hotspot_file = max(node_counts, key=node_counts.get)
+    
+    return ctx
+
+
+def _build_fallback_guidance(cycle_spec: CycleSpec, llm_response: str) -> OperatorGuidance:
+    """Build basic guidance when LLM response parsing fails."""
+    return OperatorGuidance(
+        executive_summary="The LLM response could not be parsed automatically. Manual review required.",
+        difficulty_rating="complex",
+        estimated_time="30-60 minutes",
+        prerequisites=[
+            "Review the raw LLM response below",
+            "Identify the suggested changes manually",
+            "Understand which imports create the cycle",
+        ],
+        step_by_step=[
+            "Scroll to the 'Raw LLM Response' section at the bottom",
+            "Look for suggested file changes (search for 'new_files' or 'changes')",
+            "Identify which imports need to be added or removed",
+            "Apply the changes manually in your IDE",
+            "Verify the cycle is broken by running the cycle detector",
+        ],
+        verification_steps=[
+            "Run the cycle detector to confirm the cycle is broken",
+            "Build the project to ensure no compilation errors",
+            "Run tests to verify no regressions",
+        ],
+        common_pitfalls=[
+            "The LLM may have hallucinated file paths or type names - verify they exist",
+            "Import paths may not be exact - adjust for your project structure",
+        ],
+        when_to_escalate="If the LLM response is completely garbled or empty, try re-running with a different model or more context.",
+    )
+
+
+def _build_operator_guidance(
+    report: SuggestionReport,
+    cycle_spec: CycleSpec,
+    strategy: str,
+) -> OperatorGuidance:
+    """Build comprehensive operator guidance based on the suggestions."""
+    
+    # Determine difficulty based on number and type of changes
+    new_files = len(report.files_to_create)
+    mod_files = len(report.files_to_modify)
+    total_changes = new_files + mod_files
+    
+    if total_changes <= 2 and new_files == 0:
+        difficulty = "easy"
+        time_est = "5-10 minutes"
+    elif total_changes <= 4:
+        difficulty = "moderate"
+        time_est = "15-30 minutes"
+    elif new_files > 0:
+        difficulty = "moderate"
+        time_est = "20-45 minutes"
+    else:
+        difficulty = "complex"
+        time_est = "45-90 minutes"
+    
+    # Build step-by-step based on strategy
+    steps = []
+    verification = []
+    pitfalls = []
+    prereqs = []
+    alternatives = []
+    
+    prereqs.append("Ensure you have a clean working directory (commit or stash changes)")
+    prereqs.append("Have your IDE open with the project loaded")
+    
+    if report.files_to_create:
+        steps.append(f"Create {new_files} new file(s): {', '.join(f'`{f}`' for f in report.files_to_create)}")
+        pitfalls.append("Ensure new files are in the correct directory and have proper namespaces/packages")
+    
+    if report.files_to_modify:
+        steps.append(f"Modify {mod_files} existing file(s): {', '.join(f'`{f}`' for f in report.files_to_modify)}")
+    
+    if report.imports_to_add:
+        steps.append("Add the required import statements")
+        pitfalls.append("Import paths may need adjustment for your project structure")
+    
+    if report.imports_to_remove:
+        steps.append("Remove the old import statements that create the cycle")
+    
+    steps.append("Review each change carefully before applying")
+    steps.append("Build/compile to check for errors")
+    steps.append("Run tests to verify no regressions")
+    
+    verification = [
+        "Build completes without errors",
+        "Run the cycle detector - this cycle should no longer appear",
+        "Unit tests pass",
+        "The refactored code behavior is unchanged",
+    ]
+    
+    # Strategy-specific guidance
+    if "interface" in strategy.lower():
+        steps.insert(1, "Create the interface file first (it has no dependencies)")
+        pitfalls.append("Ensure all interface methods are implemented in the concrete class")
+        alternatives.append("If interface extraction is too invasive, consider Dependency Inversion with abstract base class")
+    elif "inversion" in strategy.lower():
+        pitfalls.append("Ensure the abstraction is placed in a layer that both sides can access")
+        alternatives.append("Consider using a shared module instead if abstractions feel forced")
+    elif "shared" in strategy.lower() or "common" in strategy.lower():
+        pitfalls.append("Don't move too much into the shared module - only what's needed to break the cycle")
+        alternatives.append("Consider if the shared code belongs in a utility/common package")
+    
+    # Add common pitfalls
+    pitfalls.extend([
+        "Don't forget to update any namespace/package declarations in new files",
+        "If using dependency injection, ensure the container is updated",
+        "Watch for transitive dependencies that may recreate the cycle",
+    ])
+    
+    # Build executive summary
+    if report.cycle_will_be_broken:
+        exec_summary = f"Apply {total_changes} change(s) using **{strategy or 'suggested'}** strategy to break this cycle."
+    else:
+        exec_summary = f"Review {total_changes} suggested change(s). Manual verification needed to confirm cycle is broken."
+    
+    return OperatorGuidance(
+        executive_summary=exec_summary,
+        difficulty_rating=difficulty,
+        estimated_time=time_est,
+        prerequisites=prereqs,
+        step_by_step=steps,
+        verification_steps=verification,
+        common_pitfalls=pitfalls,
+        when_to_escalate="If compilation errors persist after applying changes, or if the cycle reappears in a different form, consult with the architecture team.",
+        alternative_approaches=alternatives,
+    )
+
+
+def _extract_import_changes(suggestion: RefactorSuggestion, report: SuggestionReport):
+    """Extract import additions/removals from a suggestion."""
+    for change in suggestion.changes:
+        # Look for imports in suggested code that aren't in original
+        orig_imports = _extract_imports(change.original_code)
+        new_imports = _extract_imports(change.suggested_code)
+        
+        for imp in new_imports - orig_imports:
+            report.imports_to_add.append({"file": suggestion.file_path, "import": imp})
+        
+        for imp in orig_imports - new_imports:
+            report.imports_to_remove.append({"file": suggestion.file_path, "import": imp})
+
+
+def _extract_imports(code: str) -> set:
+    """Extract import statements from code."""
+    imports = set()
+    
+    # Python: import X, from X import Y
+    for match in re.finditer(r'^(?:from\s+\S+\s+)?import\s+.+$', code, re.MULTILINE):
+        imports.add(match.group(0).strip())
+    
+    # C#: using X;
+    for match in re.finditer(r'^using\s+[\w.]+;', code, re.MULTILINE):
+        imports.add(match.group(0).strip())
+    
+    # Java: import X;
+    for match in re.finditer(r'^import\s+[\w.*]+;', code, re.MULTILINE):
+        imports.add(match.group(0).strip())
+    
+    # TypeScript/JS: import { X } from 'Y'
+    for match in re.finditer(r'^import\s+.+\s+from\s+[\'"].+[\'"];?', code, re.MULTILINE):
+        imports.add(match.group(0).strip())
+    
+    return imports
 
 
 def _parse_llm_response(response: str) -> Optional[Dict[str, Any]]:
@@ -143,8 +395,8 @@ def _parse_llm_response(response: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _build_new_file_suggestion(new_file: Dict[str, Any]) -> Optional[RefactorSuggestion]:
-    """Build a suggestion for a new file."""
+def _build_new_file_suggestion(new_file: Dict[str, Any], cycle_spec: CycleSpec = None) -> Optional[RefactorSuggestion]:
+    """Build a suggestion for a new file with operator guidance."""
     path = new_file.get("path", "")
     content = new_file.get("content", "")
     
@@ -161,17 +413,46 @@ def _build_new_file_suggestion(new_file: Dict[str, Any]) -> Optional[RefactorSug
         else:
             purpose = "new module"
     
+    # Build step-by-step manual instructions
+    manual_steps = [
+        f"Create a new file at path: `{path}`",
+        "Copy the content below into the file",
+        "Ensure namespace/package declaration matches your project structure",
+        "Verify all imports are available in your project",
+    ]
+    
+    # Common mistakes for new files
+    common_mistakes = [
+        "Wrong directory - ensure the file is in the correct folder",
+        "Missing namespace/package - update to match your project conventions",
+        "Incorrect imports - adjust import paths for your project structure",
+    ]
+    
+    # Testing guidance
+    if "interface" in purpose.lower():
+        testing_notes = "Verify the interface compiles. Implementers will be updated in subsequent changes."
+    elif "abstract" in purpose.lower():
+        testing_notes = "Verify the abstract class compiles and defines all necessary abstract members."
+    else:
+        testing_notes = "Verify the new file compiles and has no missing dependencies."
+    
     return RefactorSuggestion(
         file_path=path,
         title=f"Create {purpose}",
         explanation=f"Create new file `{path}` containing {purpose} to break the dependency cycle.",
         is_new_file=True,
         new_file_content=content,
+        copy_paste_ready=content,  # Same as content for new files
         confidence=0.9 if content else 0.5,
         validation_notes=[
             f"Purpose: {purpose}",
             f"Content length: {len(content)} characters",
         ],
+        manual_steps=manual_steps,
+        common_mistakes=common_mistakes,
+        testing_notes=testing_notes,
+        rollback_instructions=f"Simply delete the file `{path}` to undo this change.",
+        prerequisites=["Ensure the target directory exists"],
     )
 
 
@@ -278,6 +559,49 @@ def _build_modification_suggestion(
         suggestion.validation_notes.append("⚠️ Could not locate exact position of some changes")
     else:
         suggestion.confidence = 0.85
+    
+    # Add operator guidance for modifications
+    suggestion.manual_steps = [
+        f"Open file: `{path}`",
+    ]
+    
+    for i, chg in enumerate(suggestion.changes, 1):
+        if chg.change_type == "add":
+            suggestion.manual_steps.append(f"Add the code from Change {i} at the specified location")
+        elif chg.change_type == "remove":
+            suggestion.manual_steps.append(f"Remove the code shown in Change {i}")
+        else:
+            if chg.line_start > 0:
+                suggestion.manual_steps.append(f"Go to line {chg.line_start} and replace the code as shown in Change {i}")
+            else:
+                suggestion.manual_steps.append(f"Find and replace the code as shown in Change {i} (use search)")
+    
+    suggestion.manual_steps.append("Save the file")
+    suggestion.manual_steps.append("Verify the file compiles without errors")
+    
+    suggestion.testing_notes = "After making this change, verify the file compiles and any dependent code still works."
+    
+    # Common mistakes for modifications
+    suggestion.common_mistakes = [
+        "Search text may have whitespace differences - use your IDE's search if exact match fails",
+        "Line numbers may shift if you've made other changes - search for the code instead",
+    ]
+    
+    if any(c.line_start == 0 for c in suggestion.changes):
+        suggestion.common_mistakes.append(
+            "Some changes couldn't be precisely located - manually search for the 'Find this code' text"
+        )
+    
+    suggestion.rollback_instructions = f"Use version control (git checkout `{path}`) or undo in your editor."
+    
+    # Add potential issues to each change
+    for chg in suggestion.changes:
+        if chg.line_start == 0:
+            chg.potential_issues.append("Could not locate exact line - search for this code manually")
+        if chg.change_type == "modify" and len(chg.suggested_code) > len(chg.original_code) * 2:
+            chg.potential_issues.append("Significant code expansion - review carefully for correctness")
+        if "import" in chg.suggested_code.lower() or "using" in chg.suggested_code.lower():
+            chg.why_needed = "Update imports to reference the new abstraction instead of concrete implementation"
     
     return suggestion
 

@@ -184,6 +184,78 @@ artifacts/
     └── explanation/explanation.md  # Human-readable summary
 ```
 
+## Operating Modes
+
+The pipeline supports multiple operating modes for different use cases. These are configured in `config.yml` under `refactor:`.
+
+### Mode Comparison
+
+| Mode | Purpose | Applies Patches? | Output |
+|------|---------|-----------------|--------|
+| **Standard** | Full automated refactoring | Yes | Patched files + diffs |
+| **Suggestion** | Human-reviewable suggestions | No | Markdown guide for operators |
+| **Roadmap** | Post-attempt progress report | After attempt | What worked, what didn't, next steps |
+| **Simple Format** | Smaller LLM support (7B-14B) | Optional | Text-based format, easier to parse |
+| **Line-Based** | Precise line-level patching | Yes | Line-numbered changes |
+
+### Suggestion Mode vs Roadmap Mode
+
+These two modes serve different purposes and are often confused:
+
+#### Suggestion Mode (`suggestion_mode: true`)
+- **When**: BEFORE any changes are applied
+- **Purpose**: Generate a human-reviewable plan with step-by-step instructions
+- **Use case**: When you want a human to review and apply changes manually
+- **Output**: Comprehensive markdown report with:
+  - Cycle context (what's the problem)
+  - Suggested changes (what to do)
+  - Step-by-step manual instructions
+  - Common pitfalls to avoid
+  - Verification steps
+  - Copy-paste ready code
+
+#### Roadmap Mode (`roadmap_mode: true`)
+- **When**: AFTER an automated refactoring attempt
+- **Purpose**: Show progress on an attempted refactoring (post-mortem)
+- **Use case**: Demos and visibility when full automation doesn't succeed
+- **Output**: Progress report with:
+  - What patches succeeded
+  - What patches failed (and why)
+  - Classification of failures (hallucination, syntax, etc.)
+  - Remaining work for humans
+
+**TL;DR**: Use **Suggestion Mode** when you want a human to apply changes manually. Use **Roadmap Mode** to understand what happened during an automated attempt.
+
+### Configuring Modes
+
+In `config.yml`:
+
+```yaml
+refactor:
+  # Suggestion mode - for human operators to apply manually
+  suggestion_mode: true
+  suggestion_output_format: markdown  # or "json"
+  suggestion_context_lines: 7         # Lines of context before/after
+  
+  # Roadmap mode - for visibility into automated attempts
+  roadmap_mode: false                 # Usually used with suggestion_mode: false
+  
+  # Simple format - for smaller LLMs (7B-14B)
+  simple_format_mode: auto            # "auto", true, or false
+  
+  # Line-based patching - more precise than search/replace
+  line_based_patching: true
+```
+
+### Mode Priority
+
+When multiple modes are enabled, they are applied in this order:
+
+1. `suggestion_mode: true` → Runs suggestion mode (no patches applied)
+2. `simple_format_mode: true/auto` → Uses simple text format for LLM response
+3. `line_based_patching: true` → Uses line-number based patching
+4. Standard mode → Search/replace based patching
+
 ## Notes
 
 - **Air-gapped operation**: No external API calls - all LLM inference and embeddings run locally via Ollama or HuggingFace.
