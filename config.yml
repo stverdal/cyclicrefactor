@@ -31,6 +31,7 @@ refactor:
   suggestion_mode: true         # If true, output suggestions for review (no patches applied)
   suggestion_context_lines: 7   # Lines of context around changes
   suggestion_output_format: markdown  # "markdown" or "json"
+  minimal_diff_mode: true      # If true, generate only the minimal change needed
   # Line-based patching - uses line numbers instead of SEARCH/REPLACE
   line_based_patching: true     # Use line numbers for more reliable patching
   line_patch_backup: true       # Create backup before applying line patches
