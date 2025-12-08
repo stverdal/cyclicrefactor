@@ -685,9 +685,12 @@ The cycle between **{node_list}** could not be automatically broken.
                     artifact_dir=self.config.io.artifacts_dir,
                     artifact_id=artifact_id,
                     cycle_id=cycle_spec.id,
+                    description_text=(description.text if hasattr(description, 'text') else (description.get('text') if isinstance(description, dict) else None)),
                     last_proposal=last_proposal,
                     last_validation=last_validation,
                     validation_history=validation_history,
+                    attempt_summaries=attempt_summaries,
+                    run_metadata={"artifact_id": artifact_id, "iterations": iteration, "max_iterations": self.max_iterations},
                     config=self.config.model_dump() if hasattr(self.config, 'model_dump') else None,
                 )
                 # Attach the log report and a short narrative to the explanation

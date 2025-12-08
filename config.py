@@ -94,6 +94,14 @@ class LoggingConfig(BaseModel):
     log_llm_timestamps: bool = True  # If True, include timestamps in LLM logs
 
 
+class ReportConfig(BaseModel):
+    include_logs: bool = True
+    max_log_chars: int = 8000
+    max_llm_excerpt: int = 2000
+    max_snippet_lines: int = 20
+    redact_secrets: bool = True
+
+
 class PipelineConfig(BaseModel):
     agents_order: list = ["describer", "refactor", "validator", "explainer"]
     max_iterations: int = 1
@@ -109,6 +117,7 @@ class AppConfig(BaseModel):
     io: IOConfig = IOConfig()
     pipeline: PipelineConfig = PipelineConfig()
     logging: LoggingConfig = LoggingConfig()
+    report: ReportConfig = ReportConfig()
     auth: Dict[str, str] = {}
     prompts: Dict[str, str] = {}
 

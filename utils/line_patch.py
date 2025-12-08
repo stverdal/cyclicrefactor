@@ -178,7 +178,13 @@ def parse_line_patches(llm_response: str) -> List[Dict[str, Any]]:
                 for i, c in enumerate(changes):
                     lines = c.get("lines", [])
                     content = c.get("new_content", c.get("content", ""))
-                    content_preview = content[:50].replace('\n', '\\n') if content else "(EMPTY)"
+                    # Coerce list-like content to string if LLM returned an array of lines
+                    if isinstance(content, list):
+                        try:
+                            content = "\n".join(str(x) for x in content)
+                        except Exception:
+                            content = str(content)
+                    content_preview = (content[:50].replace('\n', '\\n') if isinstance(content, str) and content else "(EMPTY)")
                     logger.debug(f"  Change {i+1}: lines {lines}, content: {content_preview}...")
                 
     except Exception as e:
@@ -218,9 +224,15 @@ def apply_line_patches(
             line_range = change.get("lines", [])
             if len(line_range) >= 2:
                 new_content = change.get("new_content", change.get("content", ""))
-                
+                # Coerce list-like new_content to string
+                if isinstance(new_content, list):
+                    try:
+                        new_content = "\n".join(str(x) for x in new_content)
+                    except Exception:
+                        new_content = str(new_content)
+
                 # Warn if replacement is empty (potential LLM mistake)
-                if not new_content or not new_content.strip():
+                if not new_content or (isinstance(new_content, str) and not new_content.strip()):
                     range_str = f"{line_range[0]}-{line_range[1]}"
                     lines_being_deleted = line_range[1] - line_range[0] + 1
                     logger.warning(
@@ -243,10 +255,16 @@ def apply_line_patches(
         
         # Handle add_at_line for insertions
         if p.get("add_at_line") and p.get("add_content"):
+            add_content = p.get("add_content")
+            if isinstance(add_content, list):
+                try:
+                    add_content = "\n".join(str(x) for x in add_content)
+                except Exception:
+                    add_content = str(add_content)
             changes.append({
                 "start": p["add_at_line"],
                 "end": p["add_at_line"],
-                "content": p["add_content"],
+                "content": add_content,
                 "description": p.get("add_description", "Insert new content"),
                 "operation": "insert",
             })
